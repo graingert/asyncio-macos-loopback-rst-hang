@@ -47,11 +47,21 @@ occurrence prints diagnostics proving the peer socket is still established:
 
 ## Observations
 
-| Platform | Selector | Result |
+| Platform | `repro.py` (asyncio) | `repro_selectors.py` (`selectors` only) |
 | --- | --- | --- |
-| macOS 14 | `KqueueSelector` | reproduces, rarely — order **1 in 10⁵–10⁶** iterations |
-| macOS 15 | `KqueueSelector` | not observed in ~10⁶ iterations |
-| Linux | `EpollSelector` | never observed |
+| macOS 14 | **reproduces** — ~19 in 1.5M | not observed in 1.6M |
+| macOS 15 | **reproduces** — ~2 in 1.3M | not observed in 0.9M |
+| Linux | not observed in 1.4M | not observed in 1.3M |
+
+The hang reproduces under **asyncio on both macOS 14 and macOS 15**, but **not**
+with a hand-rolled `selectors` (`KqueueSelector`) loop that performs the same
+register / fill / unregister / abort-close / watch sequence — even at a higher
+iteration count. So the trigger is not raw kqueue registration alone; it is
+something asyncio's event loop does around the abortive close. The leading
+suspect is asyncio's **deferred close**: `close()` and the peer's
+`add_reader` happen on a later loop iteration (via `call_soon`), so a full
+`select()`/kqueue poll cycle runs between *unregistering* the closing fd and
+*closing* it. The tight `selectors` loop does not do that, and does not hang.
 
 GitHub Actions across `macos-14`, `macos-15`, and `ubuntu-latest` is included in
 `.github/workflows/ci.yaml`.
@@ -72,11 +82,14 @@ sockets, to stay close to what a selector-based event loop does per connection:
    data, then waits for the disconnect.
 6. If the disconnect never arrives within the timeout, the reset was lost.
 
-## Is this CPython or the OS?
+## asyncio-specific
 
-The closing side does everything correctly, so the missing RST is ultimately
-macOS kernel behavior (a reset that is not delivered to a loopback peer while the
-connection is in a zero-window / persist state). It is reported here because it
-is readily reproduced through `asyncio` and manifests as a silent, permanent
-hang of an otherwise-correct asyncio program on macOS. A pure `selectors` (no
-`asyncio`) variant is expected to exhibit it at a similarly low rate.
+The closing side is textbook-correct at `close()` time, so at first glance the
+missing RST looks like macOS kernel behavior. But the same scenario driven by a
+plain `selectors` (`KqueueSelector`) loop — `repro_selectors.py` — does **not**
+reproduce it, even at more iterations than the asyncio run needs. The hang only
+appears under `asyncio`, on macOS. That points at asyncio's event-loop handling
+around the abortive close (most likely the `call_soon`-deferred `close()`, which
+lets a poll cycle run between unregistering and closing the fd) rather than the
+kernel or kqueue alone. An otherwise-correct asyncio program on macOS can hang
+permanently as a result.

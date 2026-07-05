@@ -36,9 +36,11 @@ descriptor APIs (``add_reader`` / ``add_writer`` / ``remove_reader`` /
 
 Observed
 --------
-- macOS 14 (Kqueue): reproduces, rarely (order 1 in 10^5-10^6 iterations).
-- macOS 15 (Kqueue): not observed in ~10^6 iterations (much rarer, if present).
-- Linux (epoll): never observed.
+- macOS 14 (asyncio): reproduces (order ~1 in 10^5 iterations).
+- macOS 15 (asyncio): reproduces, rarer (order ~1 in 10^6 iterations).
+- Linux (asyncio): never observed.
+- Any platform via ``repro_selectors.py`` (a plain ``selectors`` loop doing the
+  same sequence): not observed -- the hang is asyncio-specific, not raw kqueue.
 
 Usage
 -----
