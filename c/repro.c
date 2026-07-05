@@ -45,6 +45,8 @@
 
 #define TIMEOUT_SEC 1.0
 
+static int g_stop_on_hang = 0;
+
 static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -214,6 +216,12 @@ static int one_iteration(int kq, char *buf, size_t buflen, char *desc,
             snprintf(pk, sizeof(pk), "%zdbytes", r);
         snprintf(desc, desclen, "%d<->%d SO_ERROR=%d MSG_PEEK=%s", lport, pport,
                  so, pk);
+        if (g_stop_on_hang) {
+            /* Idle so the hung connection's abort window is isolated by a clear
+             * multi-second gap of silence in a packet capture (no other
+             * connections run while we sleep). */
+            sleep(2);
+        }
     }
     close(server);
     return hung;
@@ -222,6 +230,7 @@ static int one_iteration(int kq, char *buf, size_t buflen, char *desc,
 int main(int argc, char **argv) {
     double run_seconds = argc > 1 ? atof(argv[1]) : 300.0;
     int stop_on_hang = argc > 2;
+    g_stop_on_hang = stop_on_hang;
 
     printf("c repro: raw kqueue/kevent + sockets (no libraries)\n");
     printf("run=%.0fs timeout=%.0fs (deferred close)%s\n\n", run_seconds,
