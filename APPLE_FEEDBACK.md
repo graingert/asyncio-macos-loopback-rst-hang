@@ -54,26 +54,15 @@ Every abortive `close()` results in the peer observing the reset (a `recv()` ret
 
 Occasionally the peer never observes the disconnect. Its socket stays `ESTABLISHED` — verified by the reproducer via `getpeername()` (succeeds), `getsockopt(SO_ERROR)` == 0, and `recv(..., MSG_PEEK)` == `EAGAIN`.
 
-Packet capture on `lo0` (`tcpdump`, **0 packets dropped by kernel**) shows the difference between a delivered and a hung abortive close:
+A packet capture on `lo0` (`tcpdump`, **0 packets dropped by kernel**) shows that the closing side **does put a reset on the wire** for the hung connection — an `[R.]` (RST+ACK) — yet the peer's socket does **not** transition out of `ESTABLISHED`. Example, the last packets of a capture (this is the hung connection; its ephemeral ports are unique in this run, not reused):
 
-- **Delivered** (the overwhelming majority): after the SYN handshake, the closing side emits a `[R.]` (RST+ACK, receive window non-zero) followed by one or more bare `[R]` (RST, window 0); the peer resets correctly. Example:
+```
+IP 127.0.0.1.55259 > 127.0.0.1.55258: Flags [S]
+IP 127.0.0.1.55258 > 127.0.0.1.55259: Flags [S.]
+IP 127.0.0.1.55259 > 127.0.0.1.55258: Flags [R.], seq 482705, ack 1, win 6379
+```
 
-  ```
-  IP 127.0.0.1.52872 > 127.0.0.1.52871: Flags [S]
-  IP 127.0.0.1.52871 > 127.0.0.1.52872: Flags [S.]
-  IP 127.0.0.1.52872 > 127.0.0.1.52871: Flags [R.], seq 245293, ack 1, win 6379
-  IP 127.0.0.1.52872 > 127.0.0.1.52871: Flags [R],  seq 838765268, win 0
-  ```
-
-- **Hung**: the closing side emits the `[R.]` (RST+ACK), but the peer's socket does **not** transition out of `ESTABLISHED`, and the trailing bare `[R]` (window 0) segments that accompany a clean teardown do not appear. Example (last packets of the capture; this is the hung connection):
-
-  ```
-  IP 127.0.0.1.52874 > 127.0.0.1.52873: Flags [S]
-  IP 127.0.0.1.52873 > 127.0.0.1.52874: Flags [S.]
-  IP 127.0.0.1.52874 > 127.0.0.1.52873: Flags [R.], seq 540205, ack 1, win 6379
-  ```
-
-So the reset the closing side sends does not take effect on the peer. The behavior looks related to RST validation while the receiver's window is zero. (Precise per-connection isolation in a busy capture is limited because ephemeral ports recycle within microseconds; the reproducer reliably triggers the condition for capture with kernel-level tooling.)
+So the reset is transmitted but is not applied to the peer socket. A *delivered* abortive close sends an identical-looking `[R.]` and does reset the peer, so the difference is in how the inbound reset is handled — this looks related to RST validation while the receiver's window is zero. (Precise per-connection isolation in a busy capture is limited because ephemeral ports recycle quickly; the reproducer reliably triggers the condition for capture with kernel-level tooling.)
 
 ## Configuration
 
