@@ -58,6 +58,10 @@ noisy — an occasional `0` does **not** mean "cannot reproduce"):
   macOS 14), and with the **raw `select.kqueue`** API directly (no `selectors`,
   no `asyncio`). So it is a **macOS kqueue/kernel-level lost RST**, not an asyncio
   bug.
+- It also reproduces with **no Python at all** — a pure **Rust** program
+  (`rust/`, raw `kqueue`/`kevent` via `libc`: macOS 14 **20 / 1.89M**) and a pure
+  **C** program (`c/repro.c`, raw `kqueue`/`kevent`, no libraries). This is a
+  language-agnostic **macOS kernel** bug.
 - The **deferred close amplifies it** — roughly 3–4× more frequent, and it is
   what surfaces the bug on macOS 15. "Deferred close" means a `select()` /
   kqueue poll cycle runs **between** unregistering the fd from the selector and

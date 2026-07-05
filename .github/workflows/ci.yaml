@@ -36,3 +36,48 @@ jobs:
       - name: build + run (raw kqueue via libc, no Python)
         working-directory: rust
         run: cargo run --release -- 600
+
+  c:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v4
+      - name: build + run (pure C, raw kqueue, no libraries)
+        run: |
+          cc -O2 -o repro_c c/repro.c
+          ./repro_c 600
+
+  capture:
+    # Capture lo0 during the C repro and dump the hung connection's packets --
+    # is the RST on the wire or not? (macOS 14, where it reproduces fastest.)
+    runs-on: macos-14
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v4
+      - name: on-the-wire evidence for a hung connection
+        run: |
+          set +e
+          cc -O2 -o repro_c c/repro.c
+          sudo tcpdump -n -i lo0 -B 32768 -w /tmp/lo0.pcap \
+            'tcp[tcpflags] & (tcp-syn|tcp-rst|tcp-fin) != 0' >/tmp/td.log 2>&1 &
+          TD=$!
+          sleep 3
+          ./repro_c 600 stop | tee /tmp/c.log
+          sleep 2
+          sudo kill -INT "$TD"; sleep 3
+          echo "=== macOS build ==="; sw_vers; uname -a
+          echo "=== hung connection ==="
+          hung=$(grep -oE "UNDELIVERED: [0-9]+<->[0-9]+" /tmp/c.log | tail -1)
+          echo "$hung"
+          pair=$(echo "$hung" | grep -oE "[0-9]+<->[0-9]+")
+          L=${pair%%<->*}; P=${pair##*<->}
+          echo "=== lo0 packets (SYN/RST/FIN) for $L <-> $P ==="
+          if [ -n "$L" ] && [ -n "$P" ]; then
+            sudo tcpdump -n -tt -r /tmp/lo0.pcap "port $L and port $P" 2>/dev/null
+          else
+            echo "(no hang captured this run)"
+          fi
