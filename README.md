@@ -25,8 +25,9 @@ sees the RST or a FIN. The connection is left half-open.
 ## Run
 
 ```console
-$ python3 repro.py            # runs 300s by default
-$ python3 repro.py 600        # run longer
+$ python3 repro.py             # asyncio variant, 300s by default
+$ python3 repro.py 600         # run longer
+$ python3 repro_selectors.py   # same scenario using only `selectors` (no asyncio)
 ```
 
 Exit status is non-zero if any undelivered (half-open) close is observed. Each
