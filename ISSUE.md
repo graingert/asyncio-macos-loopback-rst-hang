@@ -16,10 +16,11 @@ The closing side is textbook-correct at `close()` time (still connected, `SO_LIN
 
 Full runnable reproducers + red CI on macOS: **https://github.com/graingert/asyncio-macos-loopback-rst-hang**
 
-Three variants, all stdlib-only:
+Four variants, all stdlib-only:
 - `repro.py` — asyncio (`loop.add_reader`/`add_writer` + a `call_soon`-deferred abortive close)
 - `repro_selectors.py` — plain `selectors`, immediate close
 - `repro_selectors_deferred.py` — plain `selectors`, close deferred by one poll cycle
+- `repro_kqueue.py` — raw `select.kqueue` / `kevent`, close deferred by one poll cycle
 
 Each iteration: establish a loopback pair; the server never reads so the client's writes drive the window to zero and fill its send buffer; register the client fd, fill until `send()` blocks; unregister and abortively close the client; register the server and wait for the disconnect. If the disconnect never arrives within a timeout, the RST was lost.
 
@@ -30,12 +31,13 @@ Each iteration: establish a loopback pair; the server never reads so the client'
 | asyncio (deferred close) | **19 / 1.46M** | **4 / 0.93M** | 0 / 1.1M |
 | `selectors`, immediate close | **5 / 1.55M** | 0 / 1.16M | 0 / 1.3M |
 | `selectors`, deferred close | **21 / 1.89M** | **1 / 1.27M** | 0 / 1.3M |
+| raw `select.kqueue`, deferred close | **9 / 1.93M** | 0 / 1.36M | n/a (no kqueue) |
 
 Rates are low (~1–13 per million) and noisy, so an occasional `0` does not mean "cannot reproduce."
 
 ## Analysis
 
-1. **It is not an asyncio logic bug** — it reproduces with a plain `selectors` (`KqueueSelector`) loop and no asyncio (macOS 14, immediate close). The underlying lost RST is macOS kernel behavior.
+1. **It is not an asyncio logic bug** — it reproduces with a plain `selectors` (`KqueueSelector`) loop and no asyncio (macOS 14, immediate close), and with the **raw `select.kqueue` / `kevent` API** directly. The underlying lost RST is macOS kqueue/kernel behavior.
 2. **The deferred close amplifies it ~3–4×.** "Deferred close" = a `select()`/kqueue poll cycle runs *between* unregistering the fd and abortively closing it:
    ```
    unregister(fd)  ->  select()  ->  setsockopt(SO_LINGER {1,0}); close(fd)

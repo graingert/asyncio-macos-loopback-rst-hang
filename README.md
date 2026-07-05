@@ -29,6 +29,7 @@ sees the RST or a FIN. The connection is left half-open.
 $ python3 repro.py [SECONDS]                    # asyncio, deferred close
 $ python3 repro_selectors.py [SECONDS]          # plain selectors, immediate close
 $ python3 repro_selectors_deferred.py [SECONDS] # plain selectors, deferred close
+$ python3 repro_kqueue.py [SECONDS]             # raw select.kqueue, deferred close
 ```
 
 Default 300s. Exit status is non-zero if any undelivered (half-open) close is
@@ -49,11 +50,14 @@ noisy — an occasional `0` does **not** mean "cannot reproduce"):
 | `repro.py` — asyncio (deferred close) | **19 / 1.46M** | **4 / 0.93M** | 0 / 1.1M |
 | `repro_selectors.py` — plain `selectors`, immediate close | **5 / 1.55M** | 0 / 1.16M | 0 / 1.3M |
 | `repro_selectors_deferred.py` — plain `selectors`, deferred close | **21 / 1.89M** | **1 / 1.27M** | 0 / 1.3M |
+| `repro_kqueue.py` — raw `select.kqueue`, deferred close | **9 / 1.93M** | 0 / 1.36M | n/a (no kqueue) |
 
 ## What this shows
 
 - The hang reproduces with **pure `selectors` and no asyncio** (immediate close,
-  macOS 14). So it is a **macOS kernel-level lost RST**, not an asyncio bug.
+  macOS 14), and with the **raw `select.kqueue`** API directly (no `selectors`,
+  no `asyncio`). So it is a **macOS kqueue/kernel-level lost RST**, not an asyncio
+  bug.
 - The **deferred close amplifies it** — roughly 3–4× more frequent, and it is
   what surfaces the bug on macOS 15. "Deferred close" means a `select()` /
   kqueue poll cycle runs **between** unregistering the fd from the selector and
