@@ -51,30 +51,47 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+static void die(const char *msg) {
+    perror(msg);
+    exit(2);
+}
+
 static void set_nonblocking(int fd) {
     int fl = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0)
+        die("fcntl(O_NONBLOCK)");
 }
 
 static void make_pair(int *client_out, int *server_out) {
     int lsock = socket(AF_INET, SOCK_STREAM, 0);
+    if (lsock < 0)
+        die("socket(listen)");
     int one = 1;
-    setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0)
+        die("setsockopt(SO_REUSEADDR)");
     struct sockaddr_in a;
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
     a.sin_port = 0;
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    bind(lsock, (struct sockaddr *)&a, sizeof(a));
-    listen(lsock, 1);
+    if (bind(lsock, (struct sockaddr *)&a, sizeof(a)) < 0)
+        die("bind");
+    if (listen(lsock, 1) < 0)
+        die("listen");
 
     struct sockaddr_in bound;
     socklen_t blen = sizeof(bound);
-    getsockname(lsock, (struct sockaddr *)&bound, &blen);
+    if (getsockname(lsock, (struct sockaddr *)&bound, &blen) < 0)
+        die("getsockname");
 
     int client = socket(AF_INET, SOCK_STREAM, 0);
-    connect(client, (struct sockaddr *)&bound, sizeof(bound));
+    if (client < 0)
+        die("socket(client)");
+    if (connect(client, (struct sockaddr *)&bound, sizeof(bound)) < 0)
+        die("connect");
     int server = accept(lsock, NULL, NULL);
+    if (server < 0)
+        die("accept");
     close(lsock);
 
     set_nonblocking(client);
@@ -118,6 +135,7 @@ static int one_iteration(int kq, char *buf, size_t buflen, char *desc,
                          size_t desclen) {
     int client, server;
     make_pair(&client, &server);
+    /* Contents are irrelevant; we only need bytes to fill the send buffer. */
     static char chunk[65536];
     struct kevent evs[16];
 
@@ -149,7 +167,8 @@ static int one_iteration(int kq, char *buf, size_t buflen, char *desc,
     kev_change(kq, client, EVFILT_READ, EV_DELETE);
     kev_poll(kq, evs, 16, 0.0); /* the poll cycle between unregister and close */
     struct linger lg = {1, 0};
-    setsockopt(client, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    if (setsockopt(client, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg)) < 0)
+        die("setsockopt(SO_LINGER)");
     int lport = local_port(server);
     int pport = peer_port(server);
     close(client);
@@ -210,8 +229,12 @@ int main(int argc, char **argv) {
     fflush(stdout);
 
     int kq = kqueue();
+    if (kq < 0)
+        die("kqueue");
     size_t buflen = 1 << 20;
     char *buf = malloc(buflen);
+    if (!buf)
+        die("malloc");
     unsigned long long delivered = 0, undelivered = 0;
     char desc[128];
     double start = now_sec();

@@ -62,22 +62,34 @@ jobs:
         run: |
           set +e
           cc -O2 -o repro_c c/repro.c
-          sudo tcpdump -n -i lo0 -B 32768 -w /tmp/lo0.pcap \
+          # -U writes each packet to the file immediately (no buffering), so the
+          # capture is complete even when tcpdump is stopped; -s 128 keeps only
+          # headers.
+          sudo tcpdump -n -i lo0 -U -s 128 -w /tmp/lo0.pcap \
             'tcp[tcpflags] & (tcp-syn|tcp-rst|tcp-fin) != 0' >/tmp/td.log 2>&1 &
           TD=$!
-          sleep 3
+          # Wait until tcpdump is actually listening before starting the repro.
+          for _ in $(seq 1 40); do
+            grep -q "listening on" /tmp/td.log 2>/dev/null && break; sleep 0.25
+          done
           ./repro_c 600 stop | tee /tmp/c.log
-          sleep 2
-          sudo kill -INT "$TD"; sleep 3
+          # Stop tcpdump and let it flush + fully exit before reading the pcap.
+          sudo pkill -INT tcpdump
+          for _ in $(seq 1 40); do kill -0 "$TD" 2>/dev/null || break; sleep 0.25; done
           echo "=== macOS build ==="; sw_vers; uname -a
-          echo "=== hung connection ==="
+          echo "=== tcpdump stats (packets captured / dropped by kernel) ==="
+          cat /tmp/td.log
+          echo "=== pcap total control packets ==="
+          sudo tcpdump -n -r /tmp/lo0.pcap 2>/dev/null | wc -l
           hung=$(grep -oE "UNDELIVERED: [0-9]+<->[0-9]+" /tmp/c.log | tail -1)
-          echo "$hung"
+          echo "=== hung connection: $hung ==="
           pair=$(echo "$hung" | grep -oE "[0-9]+<->[0-9]+")
           L=${pair%%<->*}; P=${pair##*<->}
           echo "=== lo0 packets (SYN/RST/FIN) for $L <-> $P ==="
           if [ -n "$L" ] && [ -n "$P" ]; then
-            sudo tcpdump -n -tt -r /tmp/lo0.pcap "port $L and port $P" 2>/dev/null
+            sudo tcpdump -n -tt -r /tmp/lo0.pcap "port $L and port $P" 2>&1
           else
             echo "(no hang captured this run)"
           fi
+          # Diagnostic job: always green; the c/rust/python jobs are the gates.
+          exit 0
