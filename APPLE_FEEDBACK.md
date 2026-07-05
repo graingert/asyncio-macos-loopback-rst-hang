@@ -66,8 +66,11 @@ So the reset is transmitted but is not applied to the peer socket. A *delivered*
 
 ## Configuration
 
-- macOS 14.8.7 (build 23J520); `Darwin Kernel Version 23.6.0 ... xnu-10063.141.1.712.16~1/RELEASE_ARM64_VMAPPLE arm64`.
-- Hardware: Apple Silicon (arm64) — reproduced on GitHub-hosted `macos-14` runners; also seen, more rarely, on `macos-15`.
+- Reproduced on both:
+  - macOS 14.8.7 (build 23J520), `xnu-10063.141.1.712.16~1/RELEASE_ARM64_VMAPPLE arm64`;
+  - macOS 15.7.7 (build 24G720), `xnu-11417.140.69.710.16~1/RELEASE_ARM64_VMAPPLE arm64`.
+- Hardware: Apple Silicon (arm64), GitHub-hosted `macos-14` / `macos-15` runners.
+- Frequency: more frequent on macOS 14 (order ~1 in 10^5) than macOS 15 (order ~1 in 10^6). The packet capture above is from macOS 14 (it reproduces there quickly enough to capture); macOS 15 shows the same behavior but is much rarer to catch.
 - Interface: loopback (`lo0`), IPv4 127.0.0.1.
 - Not reproducible on Linux.
 
