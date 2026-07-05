@@ -53,49 +53,46 @@ jobs:
 
   capture:
     # Capture lo0 during the C repro and dump the hung connection's packets --
-    # is the RST on the wire or not? (macOS 14, where it reproduces fastest.)
-    runs-on: macos-14
-    timeout-minutes: 14
+    # is the RST on the wire or not? Runs on both macOS versions (macOS 15 is
+    # rarer, so it gets a longer budget).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 34
     steps:
       - uses: actions/checkout@v4
       - name: on-the-wire evidence for a hung connection
         run: |
           set +e
           cc -O2 -o repro_c c/repro.c
-          # -U writes each packet to the file immediately (no buffering), so the
-          # capture is complete even when tcpdump is stopped; -s 128 keeps only
-          # headers.
-          sudo tcpdump -n -i lo0 -U -s 128 -w /tmp/lo0.pcap \
+          # -U writes each packet immediately; -s 128 keeps headers only; a ring
+          # buffer (-C 40 MB, -W 3 files) caps disk use on a long run while still
+          # retaining the last ~120 MB -- and the hung connection is last.
+          sudo tcpdump -n -i lo0 -U -s 128 -C 40 -W 3 -w /tmp/lo0.pcap \
             'tcp[tcpflags] & (tcp-syn|tcp-rst|tcp-fin) != 0' >/tmp/td.log 2>&1 &
           TD=$!
           # Wait until tcpdump is actually listening before starting the repro.
           for _ in $(seq 1 40); do
             grep -q "listening on" /tmp/td.log 2>/dev/null && break; sleep 0.25
           done
-          ./repro_c 600 stop | tee /tmp/c.log
+          # Run until the first hang (exits then). macOS 15 needs more iterations.
+          ./repro_c 1800 stop | tee /tmp/c.log
           # Stop tcpdump and let it flush + fully exit before reading the pcap.
           sudo pkill -INT tcpdump
           for _ in $(seq 1 40); do kill -0 "$TD" 2>/dev/null || break; sleep 0.25; done
           echo "=== macOS build ==="; sw_vers; uname -a
           echo "=== tcpdump stats (packets captured / dropped by kernel) ==="
           cat /tmp/td.log
-          echo "=== pcap total control packets ==="
-          sudo tcpdump -n -r /tmp/lo0.pcap 2>/dev/null | wc -l
           hung=$(grep -oE "UNDELIVERED: [0-9]+<->[0-9]+" /tmp/c.log | tail -1)
           echo "=== hung connection: $hung ==="
-          # The hung connection is the LAST connection overall: the repro exits
-          # at the first hang and nothing else happens during its 1s hang. So the
-          # tail of the whole pcap is unambiguously this connection -- does a RST
-          # appear on the wire for it, or not?
-          echo "=== last 25 SYN/RST/FIN packets in the whole capture ==="
-          sudo tcpdump -n -tt -r /tmp/lo0.pcap 2>/dev/null | tail -25
-          pair=$(echo "$hung" | grep -oE "[0-9]+<->[0-9]+")
-          L=${pair%%<->*}; P=${pair##*<->}
-          echo "=== all packets for the hung 4-tuple $L <-> $P (note: pair may be reused) ==="
-          if [ -n "$L" ] && [ -n "$P" ]; then
-            sudo tcpdump -n -tt -r /tmp/lo0.pcap "port $L and port $P" 2>&1 | tail -15
-          else
-            echo "(no hang captured this run)"
-          fi
+          # The hung connection is the LAST connection overall (the repro exits at
+          # the first hang, and idles 2s afterward). Read the rotated capture files
+          # oldest->newest and tail -- does a RST appear on the wire for it?
+          echo "=== last 25 SYN/RST/FIN packets in the capture ==="
+          for f in $(ls -tr /tmp/lo0.pcap* 2>/dev/null); do
+            sudo tcpdump -n -tt -r "$f" 2>/dev/null
+          done | tail -25
           # Diagnostic job: always green; the c/rust/python jobs are the gates.
           exit 0
