@@ -39,8 +39,12 @@ Observed
 - macOS 14 (asyncio): reproduces (order ~1 in 10^5 iterations).
 - macOS 15 (asyncio): reproduces, rarer (order ~1 in 10^6 iterations).
 - Linux (asyncio): never observed.
-- Any platform via ``repro_selectors.py`` (a plain ``selectors`` loop doing the
-  same sequence): not observed -- the hang is asyncio-specific, not raw kqueue.
+
+Not asyncio-specific: it also reproduces with a plain ``selectors`` loop (see
+``repro_selectors.py`` / ``repro_selectors_deferred.py`` and the README). asyncio
+hits it most because it defers ``close()`` to a later loop iteration
+(``call_soon``), which runs a poll cycle between unregistering and closing the fd
+-- a pattern that amplifies the underlying macOS lost-RST bug ~3-4x.
 
 Usage
 -----

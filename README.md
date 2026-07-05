@@ -1,17 +1,18 @@
-# asyncio loopback abort: lost RST leaves a half-open connection on macOS
+# Lost TCP reset (RST) on macOS: abortive close of a flow-controlled loopback connection
 
 A minimal, dependency-free reproducer for a **lost TCP reset (RST) on macOS
-loopback** when the connection is driven by an `asyncio` `SelectorEventLoop`
-(`KqueueSelector`).
+loopback**. When a flow-controlled (zero receive window) loopback TCP connection
+is **abortively closed** — `setsockopt(SO_LINGER, {1, 0})` then `close()` — the
+reset is occasionally **never delivered** to the peer, leaving it half-open.
+
+Found via `asyncio`, but it is **not** asyncio-specific: it reproduces with a
+plain `selectors` loop too. Never observed on Linux.
 
 ## Symptom
 
-When a flow-controlled (zero receive window) loopback TCP connection is
-**abortively closed** by one side — `setsockopt(SO_LINGER, {1, 0})` then
-`close()` — the reset is occasionally **never delivered** to the peer. The peer
-is left with a socket that is still `ESTABLISHED` forever:
+The peer is left with a socket that stays `ESTABLISHED` forever:
 
-- its `loop.add_reader` callback never fires,
+- its registered reader callback never fires,
 - `getpeername()` still succeeds,
 - `SO_ERROR` is `0`,
 - a `MSG_PEEK` `recv()` returns `EWOULDBLOCK`.
@@ -25,71 +26,60 @@ sees the RST or a FIN. The connection is left half-open.
 ## Run
 
 ```console
-$ python3 repro.py             # asyncio variant, 300s by default
-$ python3 repro.py 600         # run longer
-$ python3 repro_selectors.py   # same scenario using only `selectors` (no asyncio)
+$ python3 repro.py [SECONDS]                    # asyncio, deferred close
+$ python3 repro_selectors.py [SECONDS]          # plain selectors, immediate close
+$ python3 repro_selectors_deferred.py [SECONDS] # plain selectors, deferred close
 ```
 
-Exit status is non-zero if any undelivered (half-open) close is observed. Each
-occurrence prints diagnostics proving the peer socket is still established:
+Default 300s. Exit status is non-zero if any undelivered (half-open) close is
+observed. Each occurrence prints diagnostics proving the peer is still
+established:
 
 ```
   [418733] UNDELIVERED: getpeername=('127.0.0.1', 49187) SO_ERROR=0 MSG_PEEK=EAGAIN
 ```
 
-## Expected vs actual
-
-- **Expected:** every abortive `close()` results in the peer's registered reader
-  observing the disconnect (a `recv()` raising `ECONNRESET`, or `EOF`), within a
-  timeout — as it always does on Linux (`epoll`).
-- **Actual (macOS 14):** rarely, the peer's reader never fires and the socket
-  stays `ESTABLISHED`.
-
 ## Observations
 
-| Platform | `repro.py` (asyncio) | `repro_selectors.py` (`selectors` only) |
-| --- | --- | --- |
-| macOS 14 | **reproduces** — ~19 in 1.5M | not observed in 1.6M |
-| macOS 15 | **reproduces** — ~2 in 1.3M | not observed in 0.9M |
-| Linux | not observed in 1.4M | not observed in 1.3M |
+Undelivered / total, from a single ~10-minute CI run per cell (rates are low and
+noisy — an occasional `0` does **not** mean "cannot reproduce"):
 
-The hang reproduces under **asyncio on both macOS 14 and macOS 15**, but **not**
-with a hand-rolled `selectors` (`KqueueSelector`) loop that performs the same
-register / fill / unregister / abort-close / watch sequence — even at a higher
-iteration count. So the trigger is not raw kqueue registration alone; it is
-something asyncio's event loop does around the abortive close. The leading
-suspect is asyncio's **deferred close**: `close()` and the peer's
-`add_reader` happen on a later loop iteration (via `call_soon`), so a full
-`select()`/kqueue poll cycle runs between *unregistering* the closing fd and
-*closing* it. The tight `selectors` loop does not do that, and does not hang.
+| variant | macOS 14 | macOS 15 | Linux |
+| --- | --- | --- | --- |
+| `repro.py` — asyncio (deferred close) | **19 / 1.46M** | **4 / 0.93M** | 0 / 1.1M |
+| `repro_selectors.py` — plain `selectors`, immediate close | **5 / 1.55M** | 0 / 1.16M | 0 / 1.3M |
+| `repro_selectors_deferred.py` — plain `selectors`, deferred close | **21 / 1.89M** | **1 / 1.27M** | 0 / 1.3M |
 
-GitHub Actions across `macos-14`, `macos-15`, and `ubuntu-latest` is included in
-`.github/workflows/ci.yaml`.
+## What this shows
 
-## What the reproducer does
+- The hang reproduces with **pure `selectors` and no asyncio** (immediate close,
+  macOS 14). So it is a **macOS kernel-level lost RST**, not an asyncio bug.
+- The **deferred close amplifies it** — roughly 3–4× more frequent, and it is
+  what surfaces the bug on macOS 15. "Deferred close" means a `select()` /
+  kqueue poll cycle runs **between** unregistering the fd from the selector and
+  abortively closing it:
 
-Each iteration uses only the low-level event-loop file descriptor APIs
-(`add_reader` / `add_writer` / `remove_reader` / `remove_writer`) plus raw
-sockets, to stay close to what a selector-based event loop does per connection:
+  ```
+  unregister(fd)  ->  select()  ->  setsockopt(SO_LINGER {1,0}); close(fd)
+  ```
+
+  The immediate-close variant does `unregister(fd)` then `close(fd)` with no poll
+  in between, and hits the bug much less often. asyncio always inserts that poll
+  cycle, because it defers the `close()` to a later loop iteration via
+  `call_soon`; that is why asyncio programs hit this most.
+- Never observed on Linux (`epoll`) across millions of iterations.
+
+## Each iteration
+
+Using only raw sockets plus the low-level fd APIs:
 
 1. Establish a loopback client + accepted server socket (both non-blocking).
 2. The server never reads, so the client's writes drive the receive window to
    zero and fill the client's send buffer.
-3. The client is registered with the loop and fills until `send()` blocks.
+3. The client fd is registered with the selector/loop and filled until `send()`
+   blocks.
 4. The client is unregistered and abortively closed (`SO_LINGER {1,0}` +
-   `close()`).
-5. The server is registered with `add_reader`; its callback drains the buffered
-   data, then waits for the disconnect.
+   `close()`) — either immediately or after one poll cycle.
+5. The server fd is registered; it drains the buffered data, then waits for the
+   disconnect (a `recv()` raising `ECONNRESET`, or EOF).
 6. If the disconnect never arrives within the timeout, the reset was lost.
-
-## asyncio-specific
-
-The closing side is textbook-correct at `close()` time, so at first glance the
-missing RST looks like macOS kernel behavior. But the same scenario driven by a
-plain `selectors` (`KqueueSelector`) loop — `repro_selectors.py` — does **not**
-reproduce it, even at more iterations than the asyncio run needs. The hang only
-appears under `asyncio`, on macOS. That points at asyncio's event-loop handling
-around the abortive close (most likely the `call_soon`-deferred `close()`, which
-lets a poll cycle run between unregistering and closing the fd) rather than the
-kernel or kqueue alone. An otherwise-correct asyncio program on macOS can hang
-permanently as a result.

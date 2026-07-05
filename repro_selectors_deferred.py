@@ -5,10 +5,11 @@ Like ``repro_selectors.py`` (pure ``selectors``, no asyncio), but with a
 ``select()`` / kqueue poll cycle runs between *unregistering* the client fd and
 *closing* it.
 
-``repro_selectors.py`` (immediate close after unregister) does NOT reproduce the
-hang; ``repro.py`` (asyncio, deferred close) DOES. This variant isolates the one
-structural difference -- the poll cycle between unregister and close -- to test
-whether that timing is the trigger.
+``repro_selectors.py`` (immediate close after unregister) reproduces the hang on
+macOS 14, but rarely. This variant inserts the poll cycle and reproduces it
+markedly more often (and surfaces it on macOS 15 too), isolating that timing as
+an amplifier of the underlying macOS lost-RST bug -- the same timing asyncio
+introduces via ``call_soon``.
 
 A persistent self-pipe stays registered so ``select()`` always has an fd to poll,
 just as asyncio's event loop always has its self-pipe registered.
