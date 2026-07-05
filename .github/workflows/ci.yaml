@@ -1,0 +1,24 @@
+name: repro
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: reproduce
+        run: python3 repro.py 600
