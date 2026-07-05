@@ -83,11 +83,17 @@ jobs:
           sudo tcpdump -n -r /tmp/lo0.pcap 2>/dev/null | wc -l
           hung=$(grep -oE "UNDELIVERED: [0-9]+<->[0-9]+" /tmp/c.log | tail -1)
           echo "=== hung connection: $hung ==="
+          # The hung connection is the LAST connection overall: the repro exits
+          # at the first hang and nothing else happens during its 1s hang. So the
+          # tail of the whole pcap is unambiguously this connection -- does a RST
+          # appear on the wire for it, or not?
+          echo "=== last 25 SYN/RST/FIN packets in the whole capture ==="
+          sudo tcpdump -n -tt -r /tmp/lo0.pcap 2>/dev/null | tail -25
           pair=$(echo "$hung" | grep -oE "[0-9]+<->[0-9]+")
           L=${pair%%<->*}; P=${pair##*<->}
-          echo "=== lo0 packets (SYN/RST/FIN) for $L <-> $P ==="
+          echo "=== all packets for the hung 4-tuple $L <-> $P (note: pair may be reused) ==="
           if [ -n "$L" ] && [ -n "$P" ]; then
-            sudo tcpdump -n -tt -r /tmp/lo0.pcap "port $L and port $P" 2>&1
+            sudo tcpdump -n -tt -r /tmp/lo0.pcap "port $L and port $P" 2>&1 | tail -15
           else
             echo "(no hang captured this run)"
           fi
