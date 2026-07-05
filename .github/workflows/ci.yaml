@@ -23,3 +23,16 @@ jobs:
           python-version: "3.13"
       - name: reproduce
         run: python3 ${{ matrix.script }} 600
+
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v4
+      - name: build + run (raw kqueue via libc, no Python)
+        working-directory: rust
+        run: cargo run --release -- 600
