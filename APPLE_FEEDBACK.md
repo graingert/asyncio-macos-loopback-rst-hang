@@ -52,21 +52,33 @@ Every abortive `close()` results in the peer observing the reset (a `recv()` ret
 
 ## Actual Result
 
-Occasionally the peer never observes the disconnect. Its socket stays `ESTABLISHED` (verified via `getpeername`, `SO_ERROR == 0`, `MSG_PEEK` → `EAGAIN`), and no RST/FIN is seen for the connection.
+Occasionally the peer never observes the disconnect. Its socket stays `ESTABLISHED` — verified by the reproducer via `getpeername()` (succeeds), `getsockopt(SO_ERROR)` == 0, and `recv(..., MSG_PEEK)` == `EAGAIN`.
 
-<!-- PACKET CAPTURE EVIDENCE: fill in from the `capture` CI job / a local run.
-     tcpdump -i lo0 of a hung connection (ports L<->P) showing whether a RST
-     appears on the wire:
+Packet capture on `lo0` (`tcpdump`, **0 packets dropped by kernel**) shows the difference between a delivered and a hung abortive close:
 
-       <paste the SYN/RST/FIN lines for the hung connection here>
+- **Delivered** (the overwhelming majority): after the SYN handshake, the closing side emits a `[R.]` (RST+ACK, receive window non-zero) followed by one or more bare `[R]` (RST, window 0); the peer resets correctly. Example:
 
-     If no RST line appears for the hung connection, the reset was never put on
-     the wire. -->
+  ```
+  IP 127.0.0.1.52872 > 127.0.0.1.52871: Flags [S]
+  IP 127.0.0.1.52871 > 127.0.0.1.52872: Flags [S.]
+  IP 127.0.0.1.52872 > 127.0.0.1.52871: Flags [R.], seq 245293, ack 1, win 6379
+  IP 127.0.0.1.52872 > 127.0.0.1.52871: Flags [R],  seq 838765268, win 0
+  ```
+
+- **Hung**: the closing side emits the `[R.]` (RST+ACK), but the peer's socket does **not** transition out of `ESTABLISHED`, and the trailing bare `[R]` (window 0) segments that accompany a clean teardown do not appear. Example (last packets of the capture; this is the hung connection):
+
+  ```
+  IP 127.0.0.1.52874 > 127.0.0.1.52873: Flags [S]
+  IP 127.0.0.1.52873 > 127.0.0.1.52874: Flags [S.]
+  IP 127.0.0.1.52874 > 127.0.0.1.52873: Flags [R.], seq 540205, ack 1, win 6379
+  ```
+
+So the reset the closing side sends does not take effect on the peer. The behavior looks related to RST validation while the receiver's window is zero. (Precise per-connection isolation in a busy capture is limited because ephemeral ports recycle within microseconds; the reproducer reliably triggers the condition for capture with kernel-level tooling.)
 
 ## Configuration
 
-- macOS: <fill in exact version + build, e.g. 14.x (23xxx) — `sw_vers`>
-- Hardware: Apple Silicon (arm64) — reproduced on GitHub-hosted `macos-14` runners; also seen (more rarely) on `macos-15`.
+- macOS 14.8.7 (build 23J520); `Darwin Kernel Version 23.6.0 ... xnu-10063.141.1.712.16~1/RELEASE_ARM64_VMAPPLE arm64`.
+- Hardware: Apple Silicon (arm64) — reproduced on GitHub-hosted `macos-14` runners; also seen, more rarely, on `macos-15`.
 - Interface: loopback (`lo0`), IPv4 127.0.0.1.
 - Not reproducible on Linux.
 
