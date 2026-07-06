@@ -69,6 +69,56 @@ jobs:
             cc -O2 -o repro_c c/repro.c
             ./repro_c 600
 
+  freebsd-capture:
+    # Native FreeBSD wire proof: the mechanism (RST seq == rcv_nxt rejected by the
+    # RFC 5961 window check) was captured on macOS. FreeBSD's tcp_input.c has the
+    # identical check, so capture lo0 on FreeBSD too and show the same signature,
+    # rather than assuming parity with Darwin. Diagnostic job (always green); the
+    # `freebsd` job above is the gate.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: on-the-wire evidence for a hung connection (FreeBSD lo0)
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          run: |
+            set +e
+            uname -a
+            cc -O2 -o repro_c c/repro.c
+            # Capture ALL tcp on lo0 so the peer's ACK (ack = last_ack_sent) and
+            # the final data burst are recorded, not just the RST. Ring-buffered.
+            tcpdump -n -i lo0 -U -s 128 -C 40 -W 3 -w /tmp/lo0.pcap 'tcp' \
+              >/tmp/td.log 2>&1 &
+            TD=$!
+            i=0
+            while [ $i -lt 40 ]; do
+              grep -q "listening on" /tmp/td.log 2>/dev/null && break
+              sleep 0.25; i=$((i+1))
+            done
+            # Run until the first hang (exits then); FreeBSD hangs within seconds.
+            ./repro_c 900 stop | tee /tmp/c.log
+            pkill -INT tcpdump
+            i=0
+            while [ $i -lt 40 ]; do kill -0 "$TD" 2>/dev/null || break; sleep 0.25; i=$((i+1)); done
+            echo "=== tcpdump stats (captured / dropped) ==="; cat /tmp/td.log
+            hung=$(grep -oE "UNDELIVERED: [0-9]+<->[0-9]+" /tmp/c.log | tail -1)
+            echo "=== hung connection: $hung ==="
+            # Isolate the hung port pair, print ABSOLUTE seq/ack (-S). Expected:
+            # the peer's last ACK is behind the RST's seq (RST seq == rcv_nxt,
+            # last_ack_sent lags), so the RFC 5961 window check drops it.
+            pair=$(echo "$hung" | grep -oE "[0-9]+<->[0-9]+")
+            if [ -n "$pair" ]; then
+              p1=${pair%%<->*}; p2=${pair##*<->}
+              echo "=== hung connection packets (absolute seq/ack), ports $p1 & $p2 ==="
+              for f in $(ls -tr /tmp/lo0.pcap* 2>/dev/null); do
+                tcpdump -n -tt -S -r "$f" "tcp and port $p1 and port $p2" 2>/dev/null
+              done | tail -40
+            else
+              echo "no hang caught in the budget"
+            fi
+
   capture:
     # Capture lo0 during the C repro and dump the hung connection's packets --
     # is the RST on the wire or not? Runs on every macOS version (macOS 15 is

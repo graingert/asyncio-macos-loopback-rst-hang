@@ -1,9 +1,17 @@
-# Lost TCP reset (RST) on macOS: abortive close of a flow-controlled loopback connection
+# TCP reset (RST) rejected by the RFC 5961 window check: abortive close of a flow-controlled loopback connection
 
-A minimal, dependency-free reproducer for a **lost TCP reset (RST) on macOS
-loopback**. When a flow-controlled (zero receive window) loopback TCP connection
-is **abortively closed** — `setsockopt(SO_LINGER, {1, 0})` then `close()` — the
-reset is occasionally **never delivered** to the peer, leaving it half-open.
+A minimal, dependency-free reproducer for a **BSD/kqueue-family kernel bug** in
+the RFC 5961 RST-acceptance check. When a **flow-controlled** loopback TCP
+connection is **abortively closed** — `setsockopt(SO_LINGER, {1, 0})` then
+`close()` — the RST is emitted correctly and put on the wire, but the peer's
+kernel **rejects a valid RST** and stays half-open.
+
+The RST carries `SEG.SEQ == SND.NXT` (RFC-correct). The receiver drops it because
+its RFC 5961 check computes the acceptance-window right edge from `last_ack_sent`
+instead of `rcv_nxt`; when the receiver is flow controlled (small `rcv_wnd`) and
+holds received-but-unacked data (delayed ACK, so `rcv_nxt > last_ack_sent`), a
+RST at `rcv_nxt` falls just past the mis-computed edge and is silently discarded.
+See [Root cause](#root-cause) for the code and packet-level proof.
 
 Found via `asyncio`, but it is **not** asyncio-specific: it reproduces with a
 plain `selectors` loop, from Rust, and from pure C. It is **not macOS-specific**
@@ -23,11 +31,53 @@ The peer is left with a socket that stays `ESTABLISHED` forever:
 - `SO_ERROR` is `0`,
 - a `MSG_PEEK` `recv()` returns `EWOULDBLOCK`.
 
-The closing side is textbook-correct at `close()` time — still connected,
-`SO_LINGER` set to `{1, 0}`, with unsent bytes in its send buffer — so per
-POSIX/BSD semantics `close()` must emit a RST. Its file descriptor is then
-released cleanly (verified with `lsof`: no lingering fd). Yet the peer never
-sees the RST or a FIN. The connection is left half-open.
+The closing side is textbook-correct: at `close()` time it is still connected,
+`SO_LINGER` is `{1, 0}`, and `close()` emits a RST at `SND.NXT`. Its file
+descriptor is then released cleanly (verified with `lsof`: no lingering fd). A
+packet capture confirms the **RST is on the wire** — so it is not "lost". The
+peer receives it and drops it in its RFC 5961 check, leaving the connection
+half-open.
+
+## Root cause
+
+The RFC 5961 §3.2 reset check (FreeBSD `sys/netinet/tcp_input.c`, ~line 2131;
+Darwin's `xnu` shares this lineage) computes its acceptance-window right edge from
+`last_ack_sent` rather than `rcv_nxt`:
+
+```c
+if ((SEQ_GEQ(th->th_seq, tp->last_ack_sent) &&
+     SEQ_LT(th->th_seq, tp->last_ack_sent + tp->rcv_wnd)) ||   // right edge is wrong
+    (tp->rcv_wnd == 0 && tp->last_ack_sent == th->th_seq)) {
+```
+
+The left edge is deliberately anchored at `last_ack_sent` ("to take into account
+delayed ACKs", per the code's own comment), but the width `rcv_wnd` is measured
+from `rcv_nxt`. So the right edge is `last_ack_sent + rcv_wnd`, short of the true
+window edge `rcv_nxt + rcv_wnd` by exactly `rcv_nxt - last_ack_sent` — the
+received-but-unacknowledged bytes. When the receiver is flow controlled (small
+`rcv_wnd`) and holds a burst of unacked data, a RST at `SEG.SEQ == rcv_nxt`
+(the sender's `SND.NXT` — RFC-correct) lands past the mis-computed edge and is
+silently dropped.
+
+Absolute-sequence capture of a real hang on `lo0` (49164 closes, 49163 is left
+`ESTABLISHED`):
+
+```
+S->C  ack 3081222923, win 246                    # last ACK the receiver sent
+C->S  P. seq 3081222923:3081223131, length 208   # closer's final data burst
+C->S  R. seq 3081223131                          # the RST — dropped by the peer
+S->C  ack 3081223131, win 243                    # peer *had* the 208 bytes unacked
+```
+
+`last_ack_sent` = 3081222923, but the peer had already accepted the 208-byte
+segment (`rcv_nxt` = 3081223131) without yet ACKing it. The RST's seq =
+3081223131 = `rcv_nxt`, which is `>= last_ack_sent + rcv_wnd` whenever
+`rcv_wnd <= 208` — so it fails both clauses and is discarded. The peer only ACKs
+3081223131 *after* the RST, proving the data was unacked when the RST arrived.
+
+A two-line receiver-side fix (anchor the right edge at `rcv_nxt + rcv_wnd`, and
+accept `rcv_nxt` as an exact match) is written up in
+[`FREEBSD_BUG.md`](FREEBSD_BUG.md).
 
 ## Run
 
@@ -74,15 +124,15 @@ so it is not architecture-specific either):
 | **FreeBSD 15.1-RELEASE (amd64)** | **312 / 10.34M** (~1 in 33k) |
 | Linux (epoll) | 0 / many millions |
 
-So this is a **BSD/kqueue-family** lost RST, present on FreeBSD at a low rate and
-amplified enormously on macOS 26.
+So this is a **BSD/kqueue-family** RST-rejection bug, present on FreeBSD at a low
+rate and amplified enormously on macOS 26.
 
 ## What this shows
 
 - The hang reproduces with **pure `selectors` and no asyncio** (immediate close,
   macOS 14), and with the **raw `select.kqueue`** API directly (no `selectors`,
-  no `asyncio`). So it is a **macOS kqueue/kernel-level lost RST**, not an asyncio
-  bug.
+  no `asyncio`). So it is a **kernel-level RST rejection** (RFC 5961 window
+  check), not an asyncio bug.
 - It also reproduces with **no Python at all** — a pure **Rust** program
   (`rust/`, raw `kqueue`/`kevent` via `libc`: macOS 14 **20 / 1.89M**, macOS 26
   **597 / 1,831**) and a pure **C** program (`c/repro.c`, raw `kqueue`/`kevent`,
@@ -105,8 +155,11 @@ amplified enormously on macOS 26.
   cycle, because it defers the `close()` to a later loop iteration via
   `call_soon`; that is why asyncio programs hit this most.
 - Reproduces on **FreeBSD** too (`c/repro.c`, 15.1-RELEASE amd64: 312 / 10.34M),
-  so the root cause is BSD-family, not something Apple added to XNU — macOS 26
-  just makes it enormously more frequent.
+  and the buggy `last_ack_sent + rcv_wnd` check is present verbatim in FreeBSD's
+  own `sys/netinet/tcp_input.c` — so the root cause is BSD-family, not something
+  Apple added to XNU. macOS 26 just makes it enormously more frequent. (The
+  wire-level capture above is from macOS; the `freebsd-capture` CI job gathers the
+  equivalent proof natively on FreeBSD.)
 - Never observed on **Linux** (`epoll`) across many millions of iterations.
 
 ## Each iteration
