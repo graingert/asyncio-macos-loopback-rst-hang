@@ -87,8 +87,11 @@ jobs:
             # Run until the first hang, so it is the LAST connection and stays in
             # the ring buffer. FreeBSD hits a hang within seconds. repro_c returns
             # non-zero when a hang occurred -> keep that as the job's exit code.
-            ./repro_c 900 stop | tee /tmp/c.log
+            # NB: do not pipe repro_c into tee -- in sh, $? would then be tee's
+            # (always 0) and the gate would go green on a hang. Capture directly.
+            ./repro_c 900 stop > /tmp/c.log 2>&1
             rc=$?
+            cat /tmp/c.log
             pkill -INT tcpdump
             i=0
             while [ $i -lt 40 ]; do kill -0 "$TD" 2>/dev/null || break; sleep 0.25; i=$((i+1)); done
