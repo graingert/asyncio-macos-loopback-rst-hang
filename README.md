@@ -6,7 +6,10 @@ is **abortively closed** — `setsockopt(SO_LINGER, {1, 0})` then `close()` — 
 reset is occasionally **never delivered** to the peer, leaving it half-open.
 
 Found via `asyncio`, but it is **not** asyncio-specific: it reproduces with a
-plain `selectors` loop too. Never observed on Linux.
+plain `selectors` loop, from Rust, and from pure C. It is **not macOS-specific**
+either — it reproduces on **FreeBSD** (the original kqueue platform) too, so it
+is a **BSD/kqueue-family** bug that macOS 26 makes dramatically more frequent.
+Never observed on Linux (`epoll`).
 
 **Reported upstream:** Apple Feedback Assistant **FB23590387** · CPython
 [python/cpython#153117](https://github.com/python/cpython/issues/153117).
@@ -60,6 +63,20 @@ undelivered counts sit at ~597 for every variant because they are wall-clock
 saturated — each hang consumes the full 1s detection timeout, so a 600s run
 tops out at ~600 hangs regardless of how many fast iterations fit in between.
 
+It is **not macOS-specific** — the same `c/repro.c` reproduces on **FreeBSD**
+(the original kqueue platform), on **`amd64`** (every macOS run above is arm64,
+so it is not architecture-specific either):
+
+| platform (`c/repro.c`, deferred close) | undelivered / total |
+| --- | --- |
+| macOS 26.4 (arm64) | **596 / 2,113** (~28%) |
+| macOS 14 (arm64) | ~1 in 10^5 |
+| **FreeBSD 15.1-RELEASE (amd64)** | **312 / 10.34M** (~1 in 33k) |
+| Linux (epoll) | 0 / many millions |
+
+So this is a **BSD/kqueue-family** lost RST, present on FreeBSD at a low rate and
+amplified enormously on macOS 26.
+
 ## What this shows
 
 - The hang reproduces with **pure `selectors` and no asyncio** (immediate close,
@@ -69,8 +86,9 @@ tops out at ~600 hangs regardless of how many fast iterations fit in between.
 - It also reproduces with **no Python at all** — a pure **Rust** program
   (`rust/`, raw `kqueue`/`kevent` via `libc`: macOS 14 **20 / 1.89M**, macOS 26
   **597 / 1,831**) and a pure **C** program (`c/repro.c`, raw `kqueue`/`kevent`,
-  no libraries: macOS 26 **596 / 2,113**). This is a language-agnostic
-  **macOS kernel** bug.
+  no libraries: macOS 26 **596 / 2,113**, FreeBSD 15.1 amd64 **312 / 10.34M**).
+  This is a language-agnostic, cross-architecture **BSD/kqueue-family kernel**
+  bug — not unique to macOS or to Apple Silicon.
 - The **deferred close amplifies it** on macOS 14/15 — roughly 3–4× more
   frequent, and it is what surfaces the bug on macOS 15. On macOS 26 the
   amplification has all but vanished: immediate close hangs ~40% of connections
@@ -86,7 +104,10 @@ tops out at ~600 hangs regardless of how many fast iterations fit in between.
   in between, and hits the bug much less often. asyncio always inserts that poll
   cycle, because it defers the `close()` to a later loop iteration via
   `call_soon`; that is why asyncio programs hit this most.
-- Never observed on Linux (`epoll`) across millions of iterations.
+- Reproduces on **FreeBSD** too (`c/repro.c`, 15.1-RELEASE amd64: 312 / 10.34M),
+  so the root cause is BSD-family, not something Apple added to XNU — macOS 26
+  just makes it enormously more frequent.
+- Never observed on **Linux** (`epoll`) across many millions of iterations.
 
 ## Each iteration
 
