@@ -8,6 +8,9 @@ reset is occasionally **never delivered** to the peer, leaving it half-open.
 Found via `asyncio`, but it is **not** asyncio-specific: it reproduces with a
 plain `selectors` loop too. Never observed on Linux.
 
+**Reported upstream:** Apple Feedback Assistant **FB23590387** · CPython
+[python/cpython#153117](https://github.com/python/cpython/issues/153117).
+
 ## Symptom
 
 The peer is left with a socket that stays `ESTABLISHED` forever:

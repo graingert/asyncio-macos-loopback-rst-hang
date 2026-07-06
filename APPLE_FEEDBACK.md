@@ -1,6 +1,6 @@
-# Apple Feedback Assistant report (draft)
+# Apple Feedback Assistant report
 
-Submit at https://feedbackassistant.apple.com. **Product** = macOS, **Area** = Networking, **Type** = Incorrect/Unexpected Behavior.
+Filed as **FB23590387** (https://feedbackassistant.apple.com/feedback/23590387 — visible to the reporter only). **Product** = macOS, **Area** = Networking, **Type** = Incorrect/Unexpected Behavior.
 
 ---
 
