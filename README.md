@@ -45,12 +45,17 @@ established:
 Undelivered / total, from a single ~10-minute CI run per cell (rates are low and
 noisy — an occasional `0` does **not** mean "cannot reproduce"):
 
-| variant | macOS 14 | macOS 15 | Linux |
-| --- | --- | --- | --- |
-| `repro.py` — asyncio (deferred close) | **19 / 1.46M** | **4 / 0.93M** | 0 / 1.1M |
-| `repro_selectors.py` — plain `selectors`, immediate close | **5 / 1.55M** | 0 / 1.16M | 0 / 1.3M |
-| `repro_selectors_deferred.py` — plain `selectors`, deferred close | **21 / 1.89M** | **1 / 1.27M** | 0 / 1.3M |
-| `repro_kqueue.py` — raw `select.kqueue`, deferred close | **9 / 1.93M** | 0 / 1.36M | n/a (no kqueue) |
+| variant | macOS 14 | macOS 15 | macOS 26 | Linux |
+| --- | --- | --- | --- | --- |
+| `repro.py` — asyncio (deferred close) | **19 / 1.46M** | **4 / 0.93M** | **596 / 1,291** | 0 / 1.1M |
+| `repro_selectors.py` — plain `selectors`, immediate close | **5 / 1.55M** | 0 / 1.16M | **597 / 1,484** | 0 / 1.3M |
+| `repro_selectors_deferred.py` — plain `selectors`, deferred close | **21 / 1.89M** | **1 / 1.27M** | **597 / 1,553** | 0 / 1.3M |
+| `repro_kqueue.py` — raw `select.kqueue`, deferred close | **9 / 1.93M** | 0 / 1.36M | **597 / 1,469** | n/a (no kqueue) |
+
+On macOS 26 the failure is no longer rare: **28–46% of connections hang**. The
+undelivered counts sit at ~597 for every variant because they are wall-clock
+saturated — each hang consumes the full 1s detection timeout, so a 600s run
+tops out at ~600 hangs regardless of how many fast iterations fit in between.
 
 ## What this shows
 
@@ -59,11 +64,14 @@ noisy — an occasional `0` does **not** mean "cannot reproduce"):
   no `asyncio`). So it is a **macOS kqueue/kernel-level lost RST**, not an asyncio
   bug.
 - It also reproduces with **no Python at all** — a pure **Rust** program
-  (`rust/`, raw `kqueue`/`kevent` via `libc`: macOS 14 **20 / 1.89M**) and a pure
-  **C** program (`c/repro.c`, raw `kqueue`/`kevent`, no libraries). This is a
-  language-agnostic **macOS kernel** bug.
-- The **deferred close amplifies it** — roughly 3–4× more frequent, and it is
-  what surfaces the bug on macOS 15. "Deferred close" means a `select()` /
+  (`rust/`, raw `kqueue`/`kevent` via `libc`: macOS 14 **20 / 1.89M**, macOS 26
+  **597 / 1,831**) and a pure **C** program (`c/repro.c`, raw `kqueue`/`kevent`,
+  no libraries: macOS 26 **596 / 2,113**). This is a language-agnostic
+  **macOS kernel** bug.
+- The **deferred close amplifies it** on macOS 14/15 — roughly 3–4× more
+  frequent, and it is what surfaces the bug on macOS 15. On macOS 26 the
+  amplification has all but vanished: immediate close hangs ~40% of connections
+  too. "Deferred close" means a `select()` /
   kqueue poll cycle runs **between** unregistering the fd from the selector and
   abortively closing it:
 
