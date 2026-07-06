@@ -74,3 +74,44 @@ On macOS (Darwin, the other kqueue platform) the same reproducer is far more fre
 
 - Apple Feedback Assistant **FB23590387** (macOS — much higher rate, with an on-the-wire packet capture).
 - CPython python/cpython#153117 (surfaces as a silent asyncio hang, because asyncio defers `close()` via `call_soon`, inserting the amplifying poll cycle).
+
+---
+
+## freebsd-net@ email (draft)
+
+Send after filing the PR (or before, if the account is still pending — mention
+the PR is forthcoming). Plain text, no HTML.
+
+**To:** freebsd-net@freebsd.org
+**Subject:** Lost TCP RST on abortive close of a zero-window loopback socket (kern, repro attached)
+
+Hi,
+
+I've hit what looks like a TCP bug in the base system and would appreciate a
+pointer to the right area. On an abortive close of a flow-controlled (zero
+receive window) loopback connection — setsockopt(SO_LINGER {1,0}) then close(),
+which should emit a RST — the RST is occasionally never delivered to the peer.
+The peer socket stays ESTABLISHED forever: EVFILT_READ never fires,
+getsockopt(SO_ERROR) == 0, recv(MSG_PEEK) == EAGAIN.
+
+I have a self-contained C reproducer (libc only, raw kqueue/kevent + sockets):
+
+  https://github.com/graingert/asyncio-macos-loopback-rst-hang  (c/repro.c)
+  cc -O2 -o repro c/repro.c && ./repro 600
+
+On FreeBSD 15.1-RELEASE (amd64) it reproduces at 312 / 10,336,808 connections
+(~1 in 33k) in a 600s run. It never reproduces on Linux (epoll). The same
+reproducer hits the identical symptom on macOS at a much higher rate (up to
+~28-46% on macOS 26); a packet capture there shows the closing side does put the
+RST on the wire, yet the peer never leaves ESTABLISHED — which suggests the
+issue is in accepting an inbound RST while the receive window is zero, rather
+than the RST not being sent.
+
+Filed as PR <NNNNNN> (Base System / kern). Also reported to Apple (FB23590387)
+and CPython (python/cpython#153117), since asyncio's deferred close makes it
+surface as a silent hang.
+
+Happy to test patches or gather more data (tcpdump, dtrace, etc.).
+
+Thanks,
+<your name>
