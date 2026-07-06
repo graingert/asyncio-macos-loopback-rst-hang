@@ -51,6 +51,24 @@ jobs:
           cc -O2 -o repro_c c/repro.c
           ./repro_c 600
 
+  freebsd:
+    # FreeBSD is the original kqueue platform. c/repro.c is pure POSIX/BSD
+    # sockets + kqueue, so it builds and runs unchanged. This distinguishes an
+    # XNU/Darwin-specific bug from a broader BSD-family one. No native runner
+    # exists, so run it in a FreeBSD VM on the Ubuntu host.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: build + run (pure C, raw kqueue) on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          run: |
+            uname -a
+            cc -O2 -o repro_c c/repro.c
+            ./repro_c 600
+
   capture:
     # Capture lo0 during the C repro and dump the hung connection's packets --
     # is the RST on the wire or not? Runs on every macOS version (macOS 15 is
