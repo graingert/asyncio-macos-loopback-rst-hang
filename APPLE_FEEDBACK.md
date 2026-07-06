@@ -24,7 +24,7 @@ On macOS, abortively closing a flow-controlled (zero receive window) loopback TC
 
 No RST or FIN is delivered; the connection is left half-open forever. The closing side is correct at `close()` time (still connected, `SO_LINGER` set to `{1,0}`, unsent bytes queued in the send buffer), and its file descriptor is released cleanly (no lingering descriptor per `lsof`). Per BSD socket semantics `close()` on such a socket must emit a RST.
 
-The failure is rare (order 1 in 10^5–10^6 connections) and is much more likely when a `kevent` poll runs between deleting the closing fd's filters and calling `close()`.
+The failure is rare on macOS 14/15 (order 1 in 10^5–10^6 connections) but frequent on macOS 26 (order 1 in 20), and is much more likely when a `kevent` poll runs between deleting the closing fd's filters and calling `close()`.
 
 ## Steps to Reproduce
 
@@ -66,11 +66,12 @@ So the reset is transmitted but is not applied to the peer socket. A *delivered*
 
 ## Configuration
 
-- Reproduced on both:
-  - macOS 14.8.7 (build 23J520), `xnu-10063.141.1.712.16~1/RELEASE_ARM64_VMAPPLE arm64`;
-  - macOS 15.7.7 (build 24G720), `xnu-11417.140.69.710.16~1/RELEASE_ARM64_VMAPPLE arm64`.
-- Hardware: Apple Silicon (arm64), GitHub-hosted `macos-14` / `macos-15` runners.
-- Frequency: more frequent on macOS 14 (order ~1 in 10^5) than macOS 15 (order ~1 in 10^6). The packet capture above is from macOS 14 (it reproduces there quickly enough to capture); macOS 15 shows the same behavior but is much rarer to catch.
+- Reproduced on all of:
+  - macOS 14.8.7 (build 23J520), `xnu-10063.141.1.712.16~1/RELEASE_ARM64_VMAPPLE arm64` (GitHub-hosted `macos-14` runner);
+  - macOS 15.7.7 (build 24G720), `xnu-11417.140.69.710.16~1/RELEASE_ARM64_VMAPPLE arm64` (GitHub-hosted `macos-15` runner);
+  - macOS 26.5.1 (build 25F80), `xnu-12377.121.6~2/RELEASE_ARM64_T8122 arm64`, MacBook Pro (Mac15,3, Apple M3) — physical hardware, not a VM.
+- Hardware: Apple Silicon (arm64) — both virtualized (VMAPPLE CI runners) and physical (M3 MacBook Pro).
+- Frequency: **dramatically more frequent on macOS 26** — order ~1 in 20 connections (59 / 1,212 in a single 60-second run of `c/repro.c`), versus ~1 in 10^5 on macOS 14 and ~1 in 10^6 on macOS 15. On macOS 26 the hung peers remain `ESTABLISHED` past a 10-second wait as well (reproducer rebuilt with `TIMEOUT_SEC 10.0`: 6 / 180), ruling out late delivery. The packet capture above is from macOS 14; macOS 15 shows the same behavior but is much rarer to catch.
 - Interface: loopback (`lo0`), IPv4 127.0.0.1.
 - Not reproducible on Linux.
 
