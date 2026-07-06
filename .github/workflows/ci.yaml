@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15, ubuntu-latest]
+        os: [macos-14, macos-15, macos-26, ubuntu-latest]
         script: [repro.py, repro_selectors.py, repro_selectors_deferred.py, repro_kqueue.py]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 12
@@ -28,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15]
+        os: [macos-14, macos-15, macos-26]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 14
     steps:
@@ -41,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15]
+        os: [macos-14, macos-15, macos-26]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 14
     steps:
@@ -53,14 +53,14 @@ jobs:
 
   capture:
     # Capture lo0 during the C repro and dump the hung connection's packets --
-    # is the RST on the wire or not? Runs on both macOS versions (macOS 15 is
-    # rarer, so it gets a longer budget).
+    # is the RST on the wire or not? Runs on every macOS version (macOS 15 is
+    # rarer, so it gets a longer budget; macOS 26 hangs within seconds).
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15]
+        os: [macos-14, macos-15, macos-26]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 34
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - name: on-the-wire evidence for a hung connection
@@ -96,3 +96,27 @@ jobs:
           done | tail -25
           # Diagnostic job: always green; the c/rust/python jobs are the gates.
           exit 0
+      - name: sysdiagnose (Apple Feedback attachment; only when a hang was caught)
+        run: |
+          set +e
+          if ! grep -q UNDELIVERED /tmp/c.log 2>/dev/null; then
+            echo "no hang caught; skipping sysdiagnose"; exit 0
+          fi
+          mkdir -p /tmp/sysdiag
+          sudo sysdiagnose -u -b -f /tmp/sysdiag
+          sudo chmod -R a+r /tmp/sysdiag
+          ls -lh /tmp/sysdiag
+          exit 0
+      - name: make capture readable for upload
+        if: always()
+        run: sudo chmod a+r /tmp/lo0.pcap* 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: capture-${{ matrix.os }}
+          if-no-files-found: warn
+          path: |
+            /tmp/lo0.pcap*
+            /tmp/c.log
+            /tmp/td.log
+            /tmp/sysdiag/*
