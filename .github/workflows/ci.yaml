@@ -57,16 +57,16 @@ jobs:
     # XNU/Darwin-specific bug from a broader BSD-family one. No native runner
     # exists, so run it in a FreeBSD VM on the Ubuntu host.
     #
-    # This single job both GATES (exits non-zero -> red on the first hang) and
-    # CAPTURES (dumps the hung connection's packets with absolute seq/ack, to
-    # prove the RFC 5961 rejection natively on FreeBSD rather than assuming
-    # parity with Darwin). It is deliberately one VM, not two: a second
-    # concurrent vmactions bootstrap trips a 429 rate limit on the VM image.
+    # This single job GATES (exits non-zero -> red on the first hang), CAPTURES
+    # the hung connection's packets (absolute seq/ack), and traces the receiver's
+    # TCP control block at the drop with DTrace -- the kernel-internal ground
+    # truth the packet capture can only infer. It is deliberately one VM, not
+    # several: concurrent vmactions bootstraps trip a 429 on the VM image.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: build + run + capture (pure C, raw kqueue) on FreeBSD
+      - name: build + run + capture + dtrace (pure C, raw kqueue) on FreeBSD
         uses: vmactions/freebsd-vm@v1
         with:
           usesh: true
@@ -74,6 +74,17 @@ jobs:
             set +e
             uname -a
             cc -O2 -o repro_c c/repro.c
+            # DTrace the RFC 5961 RST-drop path: prints the receiver's rcv_nxt /
+            # last_ack_sent / rcv_wnd vs the RST seq when a RST fails to reset an
+            # ESTABLISHED connection. Best-effort: must not break the gate.
+            dtrace -q -s dtrace/rst_drop.d >/tmp/dt.log 2>&1 &
+            DT=$!
+            # Give DTrace time to compile + instrument fbt::tcp_do_segment.
+            i=0
+            while [ $i -lt 60 ]; do
+              grep -q "HANG-RST\|dtrace:" /tmp/dt.log 2>/dev/null && break
+              sleep 0.5; i=$((i+1))
+            done
             # Capture ALL tcp on lo0 so the peer's ACK (ack = last_ack_sent) and
             # the final data burst are recorded, not just the RST. Ring-buffered.
             tcpdump -n -i lo0 -U -s 128 -C 40 -W 3 -w /tmp/lo0.pcap 'tcp' \
@@ -92,15 +103,18 @@ jobs:
             ./repro_c 900 stop > /tmp/c.log 2>&1
             rc=$?
             cat /tmp/c.log
-            pkill -INT tcpdump
+            # Let DTrace flush the probe for the last hang, then stop everything.
+            sleep 1
+            pkill -INT tcpdump; kill -INT "$DT" 2>/dev/null
             i=0
             while [ $i -lt 40 ]; do kill -0 "$TD" 2>/dev/null || break; sleep 0.25; i=$((i+1)); done
+            echo "=== DTrace: receiver TCB at each RST that failed to reset ==="
+            cat /tmp/dt.log
             echo "=== tcpdump stats (captured / dropped) ==="; cat /tmp/td.log
             hung=$(grep -oE "UNDELIVERED: [0-9]+<->[0-9]+" /tmp/c.log | tail -1)
             echo "=== hung connection: $hung ==="
-            # Isolate the hung port pair, print ABSOLUTE seq/ack (-S). Expected:
-            # the peer's last ACK is behind the RST's seq (RST seq == rcv_nxt,
-            # last_ack_sent lags), so the RFC 5961 window check drops it.
+            # Isolate the hung port pair, print ABSOLUTE seq/ack (-S). Cross-check
+            # the RST seq here against th_seq in the DTrace line above.
             pair=$(echo "$hung" | grep -oE "[0-9]+<->[0-9]+")
             if [ -n "$pair" ]; then
               p1=${pair%%<->*}; p2=${pair##*<->}
