@@ -1,17 +1,20 @@
-# TCP reset (RST) rejected by the RFC 5961 window check: abortive close of a flow-controlled loopback connection
+# TCP RST at rcv_nxt gets a challenge ACK instead of a reset: abortive close of a loopback connection
 
 A minimal, dependency-free reproducer for a **BSD/kqueue-family kernel bug** in
-the RFC 5961 RST-acceptance check. When a **flow-controlled** loopback TCP
-connection is **abortively closed** — `setsockopt(SO_LINGER, {1, 0})` then
-`close()` — the RST is emitted correctly and put on the wire, but the peer's
-kernel **rejects a valid RST** and stays half-open.
+RFC 5961 RST handling. When a loopback TCP connection is **abortively closed** —
+`setsockopt(SO_LINGER, {1, 0})` then `close()` — the RST is emitted correctly and
+put on the wire, but if the peer is holding delayed-ACKed data the peer answers
+with a **challenge ACK instead of resetting**, and the connection is left
+half-open.
 
-The RST carries `SEG.SEQ == SND.NXT` (RFC-correct). The receiver drops it because
-its RFC 5961 check computes the acceptance-window right edge from `last_ack_sent`
-instead of `rcv_nxt`; when the receiver is flow controlled (small `rcv_wnd`) and
-holds received-but-unacked data (delayed ACK, so `rcv_nxt > last_ack_sent`), a
-RST at `rcv_nxt` falls just past the mis-computed edge and is silently discarded.
-See [Root cause](#root-cause) for the code and packet-level proof.
+The RST carries `SEG.SEQ == SND.NXT == the peer's rcv_nxt` (RFC-correct — RFC 5961
+says a RST at `RCV.NXT` MUST reset). The receiver declines to reset because its
+RFC 5961 exact-match test compares `th_seq` against `last_ack_sent` instead of
+`rcv_nxt`; when a delayed/stretch ACK leaves `rcv_nxt > last_ack_sent`, the RST is
+treated as in-window-but-not-exact and gets a challenge ACK. The connection stays
+`ESTABLISHED` until a later RST retransmit — seconds later, long after an
+application timeout has seen the hang. See [Root cause](#root-cause) for the code,
+a DTrace trace of the receiver's control block at the drop, and the wire capture.
 
 Found via `asyncio`, but it is **not** asyncio-specific: it reproduces with a
 plain `selectors` loop, from Rust, and from pure C. It is **not macOS-specific**
@@ -24,7 +27,8 @@ Never observed on Linux (`epoll`).
 
 ## Symptom
 
-The peer is left with a socket that stays `ESTABLISHED` forever:
+The peer is left with a socket that stays `ESTABLISHED` (for seconds, until a RST
+retransmit — well past any reasonable app timeout):
 
 - its registered reader callback never fires,
 - `getpeername()` still succeeds,
@@ -35,48 +39,60 @@ The closing side is textbook-correct: at `close()` time it is still connected,
 `SO_LINGER` is `{1, 0}`, and `close()` emits a RST at `SND.NXT`. Its file
 descriptor is then released cleanly (verified with `lsof`: no lingering fd). A
 packet capture confirms the **RST is on the wire** — so it is not "lost". The
-peer receives it and drops it in its RFC 5961 check, leaving the connection
-half-open.
+peer receives it and, instead of resetting, sends a challenge ACK.
 
 ## Root cause
 
-The RFC 5961 §3.2 reset check (FreeBSD `sys/netinet/tcp_input.c`, ~line 2131;
-Darwin's `xnu` shares this lineage) computes its acceptance-window right edge from
-`last_ack_sent` rather than `rcv_nxt`:
+RFC 5961 §3.2 requires that a RST with `SEG.SEQ == RCV.NXT` resets the connection,
+and that an in-window RST that is *not* `RCV.NXT` draws a challenge ACK. FreeBSD's
+check (`sys/netinet/tcp_input.c`, ~line 2131; Darwin's `xnu` shares this lineage)
+does the exact-match test against `last_ack_sent`, not `rcv_nxt`:
 
 ```c
 if ((SEQ_GEQ(th->th_seq, tp->last_ack_sent) &&
-     SEQ_LT(th->th_seq, tp->last_ack_sent + tp->rcv_wnd)) ||   // right edge is wrong
+     SEQ_LT(th->th_seq, tp->last_ack_sent + tp->rcv_wnd)) ||
     (tp->rcv_wnd == 0 && tp->last_ack_sent == th->th_seq)) {
+    ...
+    if (V_tcp_insecure_rst ||
+        tp->last_ack_sent == th->th_seq) {   // <-- should also accept rcv_nxt
+        /* reset the connection */
+    } else {
+        tcp_send_challenge_ack(tp, th, m);   // <-- taken for a valid RST at rcv_nxt
+    }
+}
 ```
 
-The left edge is deliberately anchored at `last_ack_sent` ("to take into account
-delayed ACKs", per the code's own comment), but the width `rcv_wnd` is measured
-from `rcv_nxt`. So the right edge is `last_ack_sent + rcv_wnd`, short of the true
-window edge `rcv_nxt + rcv_wnd` by exactly `rcv_nxt - last_ack_sent` — the
-received-but-unacknowledged bytes. When the receiver is flow controlled (small
-`rcv_wnd`) and holds a burst of unacked data, a RST at `SEG.SEQ == rcv_nxt`
-(the sender's `SND.NXT` — RFC-correct) lands past the mis-computed edge and is
-silently dropped.
+The code comment above the test even records the incomplete choice: *"Note: to
+take into account delayed ACKs, we should test against last_ack_sent instead of
+rcv_nxt."* It tests `last_ack_sent` **only**. With the default
+`net.inet.tcp.insecure_rst = 0`, the connection resets **iff**
+`last_ack_sent == th_seq`; when `rcv_nxt > last_ack_sent` (delayed ACK), a RST at
+`rcv_nxt` is challenge-ACKed instead of resetting.
 
-Absolute-sequence capture of a real hang on `lo0` (49164 closes, 49163 is left
-`ESTABLISHED`):
+**DTrace at the moment of the drop** (`dtrace/rst_drop.d`, hooking
+`fbt::tcp_do_segment:entry`), one real hang on FreeBSD 15.1/amd64:
 
 ```
-S->C  ack 3081222923, win 246                    # last ACK the receiver sent
-C->S  P. seq 3081222923:3081223131, length 208   # closer's final data burst
-C->S  R. seq 3081223131                          # the RST — dropped by the peer
-S->C  ack 3081223131, win 243                    # peer *had* the 208 bytes unacked
+th_seq=1888935822 rcv_nxt=1888935822 last_ack_sent=1888919490 rcv_wnd=16640
+  seq-rcv_nxt        =  0     # RST is exactly at rcv_nxt -> MUST reset per RFC 5961
+  seq-last_ack_sent  = 16332  # last_ack_sent lags one full segment (delayed ACK)
+  (last_ack_sent+rcv_wnd)-seq = +308   # RST is INSIDE the window -> not a window drop
 ```
 
-`last_ack_sent` = 3081222923, but the peer had already accepted the 208-byte
-segment (`rcv_nxt` = 3081223131) without yet ACKing it. The RST's seq =
-3081223131 = `rcv_nxt`, which is `>= last_ack_sent + rcv_wnd` whenever
-`rcv_wnd <= 208` — so it fails both clauses and is discarded. The peer only ACKs
-3081223131 *after* the RST, proving the data was unacked when the RST arrived.
+`seq - rcv_nxt = 0` and a positive window margin prove this is the inner
+exact-match, not a window/right-edge drop. The matching wire capture (same
+connection; 52374 closes, 22467 is left hung):
 
-A two-line receiver-side fix (anchor the right edge at `rcv_nxt + rcv_wnd`, and
-accept `rcv_nxt` as an exact match) is written up in
+```
+52374->22467  . seq 1888919490:1888935822, length 16332   # closer's final full segment
+52374->22467  R. seq 1888935822                            # the RST, seq == rcv_nxt
+22467->52374  . ack 1888935822, win 175                    # CHALLENGE ACK -- not a reset
+   ... 3.07 s later ...
+22467->52374  F. seq 1850944913, ack 1888935822            # app gives up, closes (FIN)
+```
+
+The one-line receiver-side fix — accept `rcv_nxt` as an exact match in the reset
+test — plus a defensive right-edge change, is written up in
 [`FREEBSD_BUG.md`](FREEBSD_BUG.md).
 
 ## Run
@@ -131,8 +147,8 @@ rate and amplified enormously on macOS 26.
 
 - The hang reproduces with **pure `selectors` and no asyncio** (immediate close,
   macOS 14), and with the **raw `select.kqueue`** API directly (no `selectors`,
-  no `asyncio`). So it is a **kernel-level RST rejection** (RFC 5961 window
-  check), not an asyncio bug.
+  no `asyncio`). So it is a **kernel-level RST-handling bug** (RFC 5961 exact-match
+  test), not an asyncio bug.
 - It also reproduces with **no Python at all** — a pure **Rust** program
   (`rust/`, raw `kqueue`/`kevent` via `libc`: macOS 14 **20 / 1.89M**, macOS 26
   **597 / 1,831**) and a pure **C** program (`c/repro.c`, raw `kqueue`/`kevent`,
@@ -155,11 +171,12 @@ rate and amplified enormously on macOS 26.
   cycle, because it defers the `close()` to a later loop iteration via
   `call_soon`; that is why asyncio programs hit this most.
 - Reproduces on **FreeBSD** too (`c/repro.c`, 15.1-RELEASE amd64: 312 / 10.34M),
-  and the buggy `last_ack_sent + rcv_wnd` check is present verbatim in FreeBSD's
-  own `sys/netinet/tcp_input.c` — so the root cause is BSD-family, not something
-  Apple added to XNU. macOS 26 just makes it enormously more frequent. (The
-  wire-level capture above is from macOS; the `freebsd-capture` CI job gathers the
-  equivalent proof natively on FreeBSD.)
+  and the buggy `last_ack_sent`-based exact-match test is present verbatim in
+  FreeBSD's own `sys/netinet/tcp_input.c` — so the root cause is BSD-family, not
+  something Apple added to XNU. macOS 26 just makes it enormously more frequent.
+  On FreeBSD the `freebsd` CI job proves it natively at three levels for the same
+  connection: the symptom, the wire capture, and a **DTrace** trace of the
+  receiver's `rcv_nxt` / `last_ack_sent` / `rcv_wnd` at the drop (`dtrace/rst_drop.d`).
 - Never observed on **Linux** (`epoll`) across many millions of iterations.
 
 ## Each iteration
@@ -167,8 +184,9 @@ rate and amplified enormously on macOS 26.
 Using only raw sockets plus the low-level fd APIs:
 
 1. Establish a loopback client + accepted server socket (both non-blocking).
-2. The server never reads, so the client's writes drive the receive window to
-   zero and fill the client's send buffer.
+2. The server never reads, so the client's writes drive the server's receive
+   window down and fill the client's send buffer (and let a final segment sit
+   received-but-unacked — the `rcv_nxt > last_ack_sent` gap the bug needs).
 3. The client fd is registered with the selector/loop and filled until `send()`
    blocks.
 4. The client is unregistered and abortively closed (`SO_LINGER {1,0}` +
