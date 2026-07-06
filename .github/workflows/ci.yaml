@@ -88,8 +88,11 @@ jobs:
           # -U writes each packet immediately; -s 128 keeps headers only; a ring
           # buffer (-C 40 MB, -W 3 files) caps disk use on a long run while still
           # retaining the last ~120 MB -- and the hung connection is last.
+          # Capture ALL tcp (not just SYN/RST/FIN): to prove the seq mismatch we
+          # need the peer's zero-window ACK (its ack field = last_ack_sent = the
+          # window edge) and the 1-byte zero-window probe, not only the RST.
           sudo tcpdump -n -i lo0 -U -s 128 -C 40 -W 3 -w /tmp/lo0.pcap \
-            'tcp[tcpflags] & (tcp-syn|tcp-rst|tcp-fin) != 0' >/tmp/td.log 2>&1 &
+            'tcp' >/tmp/td.log 2>&1 &
           TD=$!
           # Wait until tcpdump is actually listening before starting the repro.
           for _ in $(seq 1 40); do
@@ -107,11 +110,24 @@ jobs:
           echo "=== hung connection: $hung ==="
           # The hung connection is the LAST connection overall (the repro exits at
           # the first hang, and idles 2s afterward). Read the rotated capture files
-          # oldest->newest and tail -- does a RST appear on the wire for it?
-          echo "=== last 25 SYN/RST/FIN packets in the capture ==="
-          for f in $(ls -tr /tmp/lo0.pcap* 2>/dev/null); do
-            sudo tcpdump -n -tt -r "$f" 2>/dev/null
-          done | tail -25
+          # oldest->newest, isolate the hung port pair, and print ABSOLUTE seq/ack
+          # (-S) so we can compare directly. Expected proof of the bug: the peer's
+          # last ACK advertises win 0 with ack = W (the window edge); the RST then
+          # carries seq = W+1 (one past the window), which the peer's RFC 5961
+          # zero-window check (seq must == last_ack_sent exactly) silently drops.
+          pair=$(echo "$hung" | grep -oE "[0-9]+<->[0-9]+")
+          if [ -n "$pair" ]; then
+            p1=${pair%%<->*}; p2=${pair##*<->}
+            echo "=== hung connection packets (absolute seq/ack), ports $p1 & $p2 ==="
+            for f in $(ls -tr /tmp/lo0.pcap* 2>/dev/null); do
+              sudo tcpdump -n -tt -S -r "$f" "tcp and port $p1 and port $p2" 2>/dev/null
+            done | tail -40
+          else
+            echo "=== no hang caught; last 25 packets (absolute seq/ack) ==="
+            for f in $(ls -tr /tmp/lo0.pcap* 2>/dev/null); do
+              sudo tcpdump -n -tt -S -r "$f" 2>/dev/null
+            done | tail -25
+          fi
           # Diagnostic job: always green; the c/rust/python jobs are the gates.
           exit 0
       - name: sysdiagnose (Apple Feedback attachment; only when a hang was caught)
