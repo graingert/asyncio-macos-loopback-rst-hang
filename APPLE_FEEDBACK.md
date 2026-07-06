@@ -57,12 +57,12 @@ Occasionally the peer never observes the disconnect. Its socket stays `ESTABLISH
 A packet capture on `lo0` shows that the closing side **does put a reset on the wire** for the hung connection — an `[R.]` (RST+ACK) — yet the peer's socket does **not** transition out of `ESTABLISHED`. On macOS 26.4 the reproducer hangs on its **first** connection, so the capture is perfectly isolated: the entire capture below (`tcpdump -n -i lo0` filtered to SYN/RST/FIN, **3 packets captured, 0 dropped by kernel**) is the hung connection and nothing else — no port reuse, no other traffic:
 
 ```
-1783325598.092457 IP 127.0.0.1.49167 > 127.0.0.1.49166: Flags [S], seq 3301250272, win 65535, options [mss 16344,nop,wscale 6,nop,nop,TS val 1345239134 ecr 0,sackOK,eol], length 0
-1783325598.092599 IP 127.0.0.1.49166 > 127.0.0.1.49167: Flags [S.], seq 3782955689, ack 3301250273, win 65535, options [mss 16344,nop,wscale 6,nop,nop,TS val 4275974469 ecr 1345239134,sackOK,eol], length 0
-1783325598.093571 IP 127.0.0.1.49167 > 127.0.0.1.49166: Flags [R.], seq 393217, ack 1, win 6380, length 0
+1783326173.386258 IP 127.0.0.1.49164 > 127.0.0.1.49163: Flags [S], seq 1586118699, win 65535, options [mss 16344,nop,wscale 6,nop,nop,TS val 4291616901 ecr 0,sackOK,eol], length 0
+1783326173.386297 IP 127.0.0.1.49163 > 127.0.0.1.49164: Flags [S.], seq 2935135109, ack 1586118700, win 65535, options [mss 16344,nop,wscale 6,nop,nop,TS val 330916714 ecr 4291616901,sackOK,eol], length 0
+1783326173.386655 IP 127.0.0.1.49164 > 127.0.0.1.49163: Flags [R.], seq 393217, ack 1, win 6380, length 0
 ```
 
-The client (port 49167) sends the RST ~1 ms after the handshake, immediately after filling the server's zero receive window; the server socket (port 49166) nevertheless remains `ESTABLISHED` (`SO_ERROR` 0, `MSG_PEEK` `EAGAIN`). The same pattern was captured earlier on macOS 14 (in a busier run, with per-connection isolation limited by ephemeral-port recycling).
+The client (port 49164) sends the RST ~0.4 ms after the handshake, immediately after filling the server's zero receive window; the server socket (port 49163) nevertheless remains `ESTABLISHED` (`SO_ERROR` 0, `MSG_PEEK` `EAGAIN`, reported by the reproducer as `49163<->49164 SO_ERROR=0 MSG_PEEK=errno 35`). The same pattern was captured earlier on macOS 14 (in a busier run, with per-connection isolation limited by ephemeral-port recycling).
 
 So the reset is transmitted but is not applied to the peer socket. A *delivered* abortive close sends an identical-looking `[R.]` and does reset the peer, so the difference is in how the inbound reset is handled — this looks related to RST validation while the receiver's window is zero.
 
