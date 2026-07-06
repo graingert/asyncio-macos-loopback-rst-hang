@@ -56,30 +56,17 @@ jobs:
     # sockets + kqueue, so it builds and runs unchanged. This distinguishes an
     # XNU/Darwin-specific bug from a broader BSD-family one. No native runner
     # exists, so run it in a FreeBSD VM on the Ubuntu host.
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - name: build + run (pure C, raw kqueue) on FreeBSD
-        uses: vmactions/freebsd-vm@v1
-        with:
-          usesh: true
-          run: |
-            uname -a
-            cc -O2 -o repro_c c/repro.c
-            ./repro_c 600
-
-  freebsd-capture:
-    # Native FreeBSD wire proof: the mechanism (RST seq == rcv_nxt rejected by the
-    # RFC 5961 window check) was captured on macOS. FreeBSD's tcp_input.c has the
-    # identical check, so capture lo0 on FreeBSD too and show the same signature,
-    # rather than assuming parity with Darwin. Diagnostic job (always green); the
-    # `freebsd` job above is the gate.
+    #
+    # This single job both GATES (exits non-zero -> red on the first hang) and
+    # CAPTURES (dumps the hung connection's packets with absolute seq/ack, to
+    # prove the RFC 5961 rejection natively on FreeBSD rather than assuming
+    # parity with Darwin). It is deliberately one VM, not two: a second
+    # concurrent vmactions bootstrap trips a 429 rate limit on the VM image.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: on-the-wire evidence for a hung connection (FreeBSD lo0)
+      - name: build + run + capture (pure C, raw kqueue) on FreeBSD
         uses: vmactions/freebsd-vm@v1
         with:
           usesh: true
@@ -97,8 +84,11 @@ jobs:
               grep -q "listening on" /tmp/td.log 2>/dev/null && break
               sleep 0.25; i=$((i+1))
             done
-            # Run until the first hang (exits then); FreeBSD hangs within seconds.
+            # Run until the first hang, so it is the LAST connection and stays in
+            # the ring buffer. FreeBSD hits a hang within seconds. repro_c returns
+            # non-zero when a hang occurred -> keep that as the job's exit code.
             ./repro_c 900 stop | tee /tmp/c.log
+            rc=$?
             pkill -INT tcpdump
             i=0
             while [ $i -lt 40 ]; do kill -0 "$TD" 2>/dev/null || break; sleep 0.25; i=$((i+1)); done
@@ -115,9 +105,9 @@ jobs:
               for f in $(ls -tr /tmp/lo0.pcap* 2>/dev/null); do
                 tcpdump -n -tt -S -r "$f" "tcp and port $p1 and port $p2" 2>/dev/null
               done | tail -40
-            else
-              echo "no hang caught in the budget"
             fi
+            # Preserve the gate: red build when a hang was observed.
+            exit $rc
 
   capture:
     # Capture lo0 during the C repro and dump the hung connection's packets --
