@@ -93,9 +93,22 @@ connection; 52374 closes, 22467 is left hung):
 22467->52374  F. seq 1850944913, ack 1888935822            # app gives up, closes (FIN)
 ```
 
-The one-line receiver-side fix — accept `rcv_nxt` as an exact match in the reset
-test — plus a defensive right-edge change, is written up in
-[`FREEBSD_BUG.md`](FREEBSD_BUG.md).
+The receiver-side fix has **two** required parts — accept `rcv_nxt` as an exact
+match in the reset test, **and** anchor the outer window clause's right edge at
+`rcv_nxt + rcv_wnd` — written up in [`FREEBSD_BUG.md`](FREEBSD_BUG.md).
+
+**Validated on a patched kernel.** Both changes were built into a FreeBSD
+15.1-RELEASE-p1 GENERIC kernel and run under QEMU/KVM (120 s each, counting every
+connection):
+
+| kernel | undelivered / total |
+| --- | --- |
+| stock GENERIC | **15 / 1,919,209** (~1 in 128k) |
+| inner exact-match fix only | 3 / 1,098,157 |
+| both fixes | **0 / 2,340,081** |
+
+The inner fix alone is *not* enough (residual 3/1.1M); both together eliminate
+the hang (0 across 2.34M connections, where the stock rate predicts ~18).
 
 ## Run
 

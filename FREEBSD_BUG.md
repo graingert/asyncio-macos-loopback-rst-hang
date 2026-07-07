@@ -112,7 +112,10 @@ for ~3 s until the application closes it.
 
 ### Suggested fix
 
-Accept `rcv_nxt` as an exact match in the reset test — the RFC 5961-mandated
+**Two** changes to the RFC 5961 RST handling are required; a patched kernel with
+only the first still hangs (see [Validation](#validation-patched-kernel)).
+
+**1. Accept `rcv_nxt` as an exact match in the reset test** — the RFC 5961-mandated
 point — in addition to the existing `last_ack_sent` leniency:
 
 ```diff
@@ -129,11 +132,11 @@ does not weaken the anti-spoofing intent: an off-path attacker must still guess
 `rcv_nxt` (or `last_ack_sent`) exactly; in-window/non-exact RSTs still draw a
 challenge ACK.
 
-A secondary, defensive change covers a rarer sub-case — when the delayed-ACK gap
-(`rcv_nxt - last_ack_sent`) exceeds `rcv_wnd`, the *outer* window clause's right
-edge (`last_ack_sent + rcv_wnd`) can fall below a RST at `rcv_nxt` and silently
-drop it before the inner test is reached. Anchoring that edge at `rcv_nxt`
-closes it:
+**2. Anchor the outer window clause's right edge at `rcv_nxt`.** When the
+delayed-ACK gap (`rcv_nxt - last_ack_sent`) exceeds `rcv_wnd`, the current right
+edge (`last_ack_sent + rcv_wnd`) falls below a RST at `rcv_nxt`, so the outer
+clause silently drops it before the inner test is ever reached. `rcv_nxt +
+rcv_wnd` is the true right edge of the receive window:
 
 ```diff
  		if ((SEQ_GEQ(th->th_seq, tp->last_ack_sent) &&
@@ -142,10 +145,22 @@ closes it:
  		    (tp->rcv_wnd == 0 && tp->last_ack_sent == th->th_seq)) {
 ```
 
-The captured hang above is fixed by the first (inner) change alone; the second is
-belt-and-suspenders. *Not yet validated against a patched kernel — the DTrace
-trace proves the mechanism; building a kernel with the fix and re-running the
-reproducer is the confirming step.*
+### Validation (patched kernel)
+
+Both changes were built into a FreeBSD 15.1-RELEASE-p1 GENERIC kernel (ident
+`RSTFIX`) and run under QEMU/KVM against `c/repro.c` (120 s, counting every
+connection):
+
+| kernel | undelivered / total |
+| --- | --- |
+| stock GENERIC | **15 / 1,919,209** (~1 in 128k) |
+| change 1 only (inner exact-match) | 3 / 1,098,157 (~1 in 366k) |
+| changes 1 + 2 | **0 / 2,340,081** |
+
+Change 1 alone reduces but does **not** eliminate the hang (the residual is the
+outer-clause drop that change 2 targets). Both changes together eliminate it:
+zero hangs across 2.34M connections, where the stock rate predicts ~18. `uname`
+confirmed the `RSTFIX` kernel was the one running for each patched measurement.
 
 ## How to reproduce
 
@@ -262,10 +277,13 @@ On FreeBSD 15.1-RELEASE (amd64) it reproduces at 312 / 10,336,808 connections
 (~1 in 33k) in a 600s run; never on Linux (epoll). The same reproducer hits it
 far more often on macOS (up to ~28-46% on macOS 26), which shares this code.
 
-Suggested fix: accept rcv_nxt as an exact match in the reset test (details + diff
-in PR <NNNNNN>). Also reported to Apple (FB23590387) and CPython
-(python/cpython#153117), since asyncio's deferred close makes it surface as a
-silent hang.
+Suggested fix (two parts: accept rcv_nxt as an exact match in the reset test, and
+anchor the outer window edge at rcv_nxt + rcv_wnd; details + diff in PR <NNNNNN>).
+I built both into a 15.1p1 GENERIC kernel and ran the reproducer under QEMU/KVM:
+stock hangs at 15/1,919,209, both changes give 0/2,340,081 (the inner change
+alone is not enough: 3/1,098,157). Also reported to Apple (FB23590387) and
+CPython (python/cpython#153117), since asyncio's deferred close makes it surface
+as a silent hang.
 
 Happy to test patches or gather more data (tcpdump, dtrace, etc.).
 
