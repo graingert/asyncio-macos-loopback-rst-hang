@@ -11,10 +11,12 @@ The RST carries `SEG.SEQ == SND.NXT == the peer's rcv_nxt` (RFC-correct — RFC 
 says a RST at `RCV.NXT` MUST reset). The receiver declines to reset because its
 RFC 5961 exact-match test compares `th_seq` against `last_ack_sent` instead of
 `rcv_nxt`; when a delayed/stretch ACK leaves `rcv_nxt > last_ack_sent`, the RST is
-treated as in-window-but-not-exact and gets a challenge ACK. The connection stays
-`ESTABLISHED` until a later RST retransmit — seconds later, long after an
-application timeout has seen the hang. See [Root cause](#root-cause) for the code,
-a DTrace trace of the receiver's control block at the drop, and the wire capture.
+treated as in-window-but-not-exact and gets a challenge ACK. The originating side
+has already fully closed (nothing retransmits the RST), so the connection stays
+`ESTABLISHED` until the application gives up and closes it — seconds later, long
+after an application timeout has seen the hang. See [Root cause](#root-cause) for
+the code, a DTrace trace of the receiver's control block at the drop, and the
+wire capture.
 
 Found via `asyncio`, but it is **not** asyncio-specific: it reproduces with a
 plain `selectors` loop, from Rust, and from pure C. It is **not macOS-specific**
@@ -27,8 +29,8 @@ Never observed on Linux (`epoll`).
 
 ## Symptom
 
-The peer is left with a socket that stays `ESTABLISHED` (for seconds, until a RST
-retransmit — well past any reasonable app timeout):
+The peer is left with a socket that stays `ESTABLISHED` (until the application
+gives up and closes it — well past any reasonable app timeout):
 
 - its registered reader callback never fires,
 - `getpeername()` still succeeds,
@@ -45,7 +47,7 @@ peer receives it and, instead of resetting, sends a challenge ACK.
 
 RFC 5961 §3.2 requires that a RST with `SEG.SEQ == RCV.NXT` resets the connection,
 and that an in-window RST that is *not* `RCV.NXT` draws a challenge ACK. FreeBSD's
-check (`sys/netinet/tcp_input.c`, ~line 2131; Darwin's `xnu` shares this lineage)
+check (`sys/netinet/tcp_input.c`, ~line 2160 in 15.1-RELEASE; Darwin's `xnu` shares this lineage)
 does the exact-match test against `last_ack_sent`, not `rcv_nxt`:
 
 ```c

@@ -37,15 +37,16 @@ The connection stays `ESTABLISHED` (half-open):
 
 The peer that sent the RST is correct — the RST goes out with `SEG.SEQ ==
 SND.NXT == the receiver's rcv_nxt`, exactly RFC-conformant. It is the *receiver*
-that declines to reset. The connection is only torn down later, when a
-retransmitted RST arrives after the challenge ACK has advanced `last_ack_sent`
-up to `rcv_nxt` — seconds later, long after an application timeout has already
-observed the hang.
+that declines to reset. The originating side has already fully closed (its
+`tcpcb` is gone after the abortive `close()`), so nothing retransmits the RST;
+the receiver simply stays `ESTABLISHED` until the application gives up and closes
+the socket itself. In the capture below that is a FIN ~3 s later — long after an
+application timeout has already observed the hang.
 
 ### Root cause
 
-`sys/netinet/tcp_input.c`, RFC 5961 §3.2 handling (FreeBSD 15.1, around line
-2131):
+`sys/netinet/tcp_input.c`, RFC 5961 §3.2 handling (FreeBSD 15.1-RELEASE, the
+`if (thflags & TH_RST)` block at line 2148, check at line 2160):
 
 ```c
 if ((SEQ_GEQ(th->th_seq, tp->last_ack_sent) &&
@@ -115,11 +116,12 @@ Accept `rcv_nxt` as an exact match in the reset test — the RFC 5961-mandated
 point — in addition to the existing `last_ack_sent` leniency:
 
 ```diff
- 		if (V_tcp_insecure_rst ||
--		    tp->last_ack_sent == th->th_seq) {
-+		    tp->last_ack_sent == th->th_seq ||
-+		    tp->rcv_nxt == th->th_seq) {
- 			/* reset the connection */
+ 			if (V_tcp_insecure_rst ||
+-			    tp->last_ack_sent == th->th_seq) {
++			    tp->last_ack_sent == th->th_seq ||
++			    tp->rcv_nxt == th->th_seq) {
+ 				TCPSTAT_INC(tcps_drops);
+ 				/* Drop the connection. */
 ```
 
 This is strictly *more* RFC 5961-conformant (a RST at `RCV.NXT` MUST reset) and
@@ -203,8 +205,7 @@ other kqueue platform, same RFC 5961 lineage) the rate is far higher — up to
 - FreeBSD 15.1-RELEASE, GENERIC, **amd64** (`FreeBSD 15.1-RELEASE releng/15.1-n283562-96841ea08dcf`), on a GitHub-hosted `vmactions/freebsd-vm` guest.
 - Interface: loopback (`lo0`), IPv4 127.0.0.1.
 - `net.inet.tcp.insecure_rst = 0` (default).
-- Not reproducible on Linux (epoll) — its RST acceptance is checked against the
-  actual next-expected sequence number.
+- Not reproducible on Linux (epoll) across many millions of iterations.
 
 ## Related reports (same reproducer, other platforms)
 
@@ -234,10 +235,10 @@ RFC 5961 resets the connection when an incoming RST has SEG.SEQ == RCV.NXT, and
 challenge-ACKs an in-window RST that is not exactly RCV.NXT. The check does the
 exact-match test against last_ack_sent, not rcv_nxt. When the receiver has
 received-but-unacked data (delayed ACK, rcv_nxt > last_ack_sent), a valid RST at
-rcv_nxt (== the sender's SND.NXT) is challenge-ACKed instead of resetting, and
-the connection is left ESTABLISHED until a later RST retransmit -- long enough
-for an application to see a hang. EVFILT_READ never fires, SO_ERROR == 0,
-recv(MSG_PEEK) == EAGAIN.
+rcv_nxt (== the sender's SND.NXT) is challenge-ACKed instead of resetting. The
+sender has already fully closed (nothing retransmits the RST), so the connection
+is left ESTABLISHED until the application gives up -- long enough to see a hang.
+EVFILT_READ never fires, SO_ERROR == 0, recv(MSG_PEEK) == EAGAIN.
 
 DTrace at the drop (fbt::tcp_do_segment:entry), one hang:
 
