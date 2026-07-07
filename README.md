@@ -97,18 +97,24 @@ The receiver-side fix has **two** required parts — accept `rcv_nxt` as an exac
 match in the reset test, **and** anchor the outer window clause's right edge at
 `rcv_nxt + rcv_wnd` — written up in [`FREEBSD_BUG.md`](FREEBSD_BUG.md).
 
-**Validated on a patched kernel.** Both changes were built into a FreeBSD
-15.1-RELEASE-p1 GENERIC kernel and run under QEMU/KVM (120 s each, counting every
-connection):
+**Validated on a patched kernel.** Built into FreeBSD 15.1-RELEASE-p1 GENERIC
+kernels under QEMU/KVM, with distinct idents (`uname -i`-verified) so each result
+is unambiguously attributable:
 
-| kernel | undelivered / total |
+| kernel (`uname -i`) | result |
 | --- | --- |
-| stock GENERIC | **15 / 1,919,209** (~1 in 128k) |
-| inner exact-match fix only | 3 / 1,098,157 |
-| both fixes | **0 / 2,340,081** |
+| stock `GENERIC` | hangs — **15 / 1,919,209** (~1 in 128k); DTrace: every hang is the challenge-ACK case |
+| `RSTINNER` (inner fix only) | primary hang gone, **residual persists** (first hang at 287k / 19.9M connections) |
+| `RSTBOTH` (both fixes) | **0 / 31,651,215** |
 
-The inner fix alone is *not* enough (residual 3/1.1M); both together eliminate
-the hang (0 across 2.34M connections, where the stock rate predicts ~18).
+The inner fix alone is *not* enough: a residual persists, and a `tcpdump` capture
+on `RSTINNER` proves it is the **outer-clause drop** the second change targets
+(RST at `rcv_nxt`, `last_ack_sent` lagging one 16332-byte segment, `rcv_wnd≈308`,
+so `seq ≫ last_ack_sent + rcv_wnd` → silently dropped). Both changes together
+eliminate the hang (0 across 31.65M connections, where `RSTINNER` hit it within
+~20M). The residual is a timing-sensitive Heisenbug — bursty, and perturbed by
+`fbt` DTrace on the hot path, so the wire capture uses `tcpdump`'s BPF tap; see
+[`FREEBSD_BUG.md`](FREEBSD_BUG.md).
 
 ## Run
 

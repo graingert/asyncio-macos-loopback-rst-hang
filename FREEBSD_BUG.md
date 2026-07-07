@@ -147,20 +147,41 @@ rcv_wnd` is the true right edge of the receive window:
 
 ### Validation (patched kernel)
 
-Both changes were built into a FreeBSD 15.1-RELEASE-p1 GENERIC kernel (ident
-`RSTFIX`) and run under QEMU/KVM against `c/repro.c` (120 s, counting every
-connection):
+Built into FreeBSD 15.1-RELEASE-p1 GENERIC kernels under QEMU/KVM and run against
+`c/repro.c`. To remove any ambiguity about which kernel produced which result,
+the two patched kernels carry distinct idents (verified live with `uname -i`):
+`RSTINNER` (change 1 only) and `RSTBOTH` (changes 1 + 2).
 
-| kernel | undelivered / total |
+| kernel (`uname -i`) | result |
 | --- | --- |
-| stock GENERIC | **15 / 1,919,209** (~1 in 128k) |
-| change 1 only (inner exact-match) | 3 / 1,098,157 (~1 in 366k) |
-| changes 1 + 2 | **0 / 2,340,081** |
+| stock `GENERIC` | hangs — e.g. **15 / 1,919,209** (~1 in 128k); DTrace confirmed every hang is the challenge-ACK case (change 1's target) |
+| `RSTINNER` (change 1) | primary hang gone, but the **residual persists** — first hang seen at 287,392 / 19,946,282 connections in separate runs |
+| `RSTBOTH` (changes 1 + 2) | **0 / 31,651,215** |
 
-Change 1 alone reduces but does **not** eliminate the hang (the residual is the
-outer-clause drop that change 2 targets). Both changes together eliminate it:
-zero hangs across 2.34M connections, where the stock rate predicts ~18. `uname`
-confirmed the `RSTFIX` kernel was the one running for each patched measurement.
+**The residual is the outer-clause drop (change 2's target), captured on the
+wire** on `RSTINNER` (`tcpdump -S`; 45605 closes, 50033 is left hung):
+
+```
+S->C  ack 3142883995, win 65 (=16640 B)          # last ACK: last_ack_sent = 3142883995
+C->S  . seq 3142883995:3142900327, length 16332  # final data segment (delayed-ACKed)
+C->S  R. seq 3142900327                           # RST at rcv_nxt (= snd_max)
+S->C  . ack 3142900327, win 320                   # server acks the data; the RST was silently dropped
+```
+
+`last_ack_sent` (3142883995) lags `rcv_nxt` (3142900327) by a full 16332-byte
+segment (delayed ACK), and `rcv_wnd` has shrunk to ~308, so the RST's seq sits far
+beyond `last_ack_sent + rcv_wnd = 3142884303` → the outer clause drops it before
+the inner test. Change 2 (`rcv_nxt + rcv_wnd = 3142900635 > seq`) accepts it, then
+change 1 resets. `RSTBOTH` eliminates it (0 across 31.65M connections, where
+`RSTINNER` hit it within ~20M).
+
+**Caveat — the residual is a timing-sensitive Heisenbug.** It needs a tight race
+(the RST landing after the receiver absorbs the final segment but before its
+delayed ACK, with the window already below the gap), so its rate is extremely
+bursty (a first hang anywhere from ~290k to >18M connections) and it is perturbed
+by `fbt` DTrace on `tcp_do_segment` (which adds hot-path latency); the wire
+capture above uses `tcpdump`'s out-of-band BPF tap, which does not disturb it. The
+*primary* hang is not timing-fragile (DTrace matched it exactly, 17/17).
 
 ## How to reproduce
 
