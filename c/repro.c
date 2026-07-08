@@ -23,9 +23,12 @@
  *   5. If the disconnect never arrives within TIMEOUT, the reset was lost.
  *
  * Build:  cc -O2 -o repro repro.c
- * Run:    ./repro [SECONDS] [stop]
+ * Run:    ./repro [SECONDS] [stop] [-jN]
  *           SECONDS: how long to run (default 300)
  *           stop:    if present, exit at the first lost RST (for packet capture)
+ *           -jN:     run N worker processes in parallel (default 1), to multiply
+ *                    attempts on multi-core hosts. The bug is rare, so more
+ *                    attempts per second makes it more likely to be observed.
  *
  * Exit status is non-zero if any lost RST is observed.
  */
@@ -38,14 +41,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/event.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #define TIMEOUT_SEC 1.0
 
 static int g_stop_on_hang = 0;
+
+/* Shared across worker processes (mmap MAP_SHARED|MAP_ANON) so -jN workers
+ * aggregate their counts and honour a single stop-on-hang. */
+struct shared {
+    unsigned long long delivered;
+    unsigned long long undelivered;
+    volatile int stop;
+};
+static struct shared *g_sh;
 
 static double now_sec(void) {
     struct timespec ts;
@@ -227,16 +241,9 @@ static int one_iteration(int kq, char *buf, size_t buflen, char *desc,
     return hung;
 }
 
-int main(int argc, char **argv) {
-    double run_seconds = argc > 1 ? atof(argv[1]) : 300.0;
-    int stop_on_hang = argc > 2;
-    g_stop_on_hang = stop_on_hang;
-
-    printf("c repro: raw kqueue/kevent + sockets (no libraries)\n");
-    printf("run=%.0fs timeout=%.0fs (deferred close)%s\n\n", run_seconds,
-           TIMEOUT_SEC, stop_on_hang ? " [stop at first hang]" : "");
-    fflush(stdout);
-
+/* One worker process: runs the loop until the deadline or the shared stop flag,
+ * accumulating counts into the shared struct. */
+static void run_worker(double run_seconds) {
     int kq = kqueue();
     if (kq < 0)
         die("kqueue");
@@ -244,23 +251,72 @@ int main(int argc, char **argv) {
     char *buf = malloc(buflen);
     if (!buf)
         die("malloc");
-    unsigned long long delivered = 0, undelivered = 0;
     char desc[128];
     double start = now_sec();
 
-    while (now_sec() - start < run_seconds) {
+    while (now_sec() - start < run_seconds && !g_sh->stop) {
         if (one_iteration(kq, buf, buflen, desc, sizeof(desc))) {
-            undelivered++;
-            printf("  [%llu] UNDELIVERED: %s\n", delivered + undelivered, desc);
+            unsigned long long idx = __sync_add_and_fetch(&g_sh->undelivered, 1);
+            printf("  [%llu] UNDELIVERED: %s\n", idx + g_sh->delivered, desc);
             fflush(stdout);
-            if (stop_on_hang)
+            if (g_stop_on_hang) {
+                g_sh->stop = 1;
                 break;
+            }
         } else {
-            delivered++;
+            __sync_add_and_fetch(&g_sh->delivered, 1);
         }
     }
     close(kq);
+    free(buf);
+}
 
+int main(int argc, char **argv) {
+    double run_seconds = 300.0;
+    int stop_on_hang = 0;
+    int workers = 1;
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "-j", 2) == 0) {
+            workers = atoi(argv[i] + 2);
+            if (workers < 1)
+                workers = 1;
+        } else if (strcmp(argv[i], "stop") == 0) {
+            stop_on_hang = 1;
+        } else {
+            run_seconds = atof(argv[i]);
+        }
+    }
+    g_stop_on_hang = stop_on_hang;
+
+    printf("c repro: raw kqueue/kevent + sockets (no libraries)\n");
+    printf("run=%.0fs timeout=%.0fs workers=%d (deferred close)%s\n\n",
+           run_seconds, TIMEOUT_SEC, workers,
+           stop_on_hang ? " [stop at first hang]" : "");
+    fflush(stdout);
+
+    g_sh = mmap(NULL, sizeof(*g_sh), PROT_READ | PROT_WRITE,
+                MAP_SHARED | MAP_ANON, -1, 0);
+    if (g_sh == MAP_FAILED)
+        die("mmap");
+    g_sh->delivered = g_sh->undelivered = 0;
+    g_sh->stop = 0;
+
+    if (workers > 256)
+        workers = 256;
+    for (int i = 0; i < workers; i++) {
+        pid_t p = fork();
+        if (p < 0)
+            die("fork");
+        if (p == 0) {
+            run_worker(run_seconds);
+            _exit(0);
+        }
+    }
+    while (wait(NULL) > 0)
+        ;
+
+    unsigned long long delivered = g_sh->delivered;
+    unsigned long long undelivered = g_sh->undelivered;
     unsigned long long total = delivered + undelivered;
     printf("\ndelivered   = %llu/%llu\n", delivered, total);
     printf("UNDELIVERED = %llu/%llu\n", undelivered, total);
