@@ -1,14 +1,12 @@
-# FreeBSD bug report (draft)
+# FreeBSD bug report
 
-**First, get a Bugzilla account.** Auto-registration is disabled (AI-spam); email
-**bugmeister@FreeBSD.org** from a legitimate address requesting an account, and
-wait for the confirmation email before you can log in.
+**Filed as bug 296594:** https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=296594
+(Base System / kern). Patch against `main` (-CURRENT):
+`freebsd-current-tcp-rst-rcvnxt.patch`.
 
-Then file at https://bugs.freebsd.org/bugzilla/ — **Product** = `Base System`,
-**Component** = `kern`, **Version** = `15.1-RELEASE`, **Hardware/OS** = `amd64` /
-`FreeBSD`. After filing, email a short note linking the PR to
-**freebsd-net@freebsd.org** (the network-stack maintainers watch the list, not
-Bugzilla).
+Next: email a short note linking the PR to **freebsd-net@freebsd.org** (the
+network-stack maintainers watch the list, not Bugzilla) — draft at the end of
+this file.
 
 ---
 
@@ -215,6 +213,24 @@ by `fbt` DTrace on `tcp_do_segment` (which adds hot-path latency); the wire
 capture above uses `tcpdump`'s out-of-band BPF tap, which does not disturb it. The
 *primary* hang is not timing-fragile (DTrace matched it exactly, 17/17).
 
+### Regression tests (packetdrill)
+
+Two deterministic packetdrill scripts, one per fix, live in `tests/`. Verified on
+FreeBSD 16.0-CURRENT under QEMU/KVM against a stock GENERIC kernel and one patched
+with `freebsd-current-tcp-rst-rcvnxt.patch` (both use a non-blocking socket so the
+buggy case fails fast with `EAGAIN` rather than blocking):
+
+| test | stock | patched |
+| --- | --- | --- |
+| `rst-rcvnxt-challenge-ack.pkt` (fix 1: RST at rcv_nxt, in-window) | RED — challenge-ACK'd (`read` → EAGAIN) | GREEN — `ECONNRESET` |
+| `rst-rcvnxt-window-drop.pkt` (fix 2: rcv_wnd shrunk below the gap) | RED — silently dropped (no challenge ACK) | GREEN — `ECONNRESET` |
+
+The window-drop test uses a small `SO_RCVBUF` (< 2·MSS, so it is not rounded up)
+and a sub-MSS delay-ACKed fill to shrink `rcv_wnd` below the gap, so the RST at
+`rcv_nxt` lands beyond `last_ack_sent + rcv_wnd` — confirmed live with DTrace on
+`tcp_do_segment`. It requires both fixes (a fix-1-only kernel still drops it at the
+unfixed outer edge).
+
 ## How to reproduce
 
 Self-contained C reproducer, no dependencies beyond libc:
@@ -337,7 +353,7 @@ reproducer under QEMU/KVM, neither reproduces (OpenBSD 7.4: 0/1,512,615; NetBSD
 9.3: 0/915,874), while FreeBSD does.
 
 Suggested fix (two parts: accept rcv_nxt as an exact match in the reset test, and
-anchor the outer window edge at rcv_nxt + rcv_wnd; details + diff in PR <NNNNNN>).
+anchor the outer window edge at rcv_nxt + rcv_wnd; details + diff in bug 296594).
 I built both into a 15.1p1 GENERIC kernel and ran the reproducer under QEMU/KVM:
 stock hangs at 15/1,919,209, both changes give 0/2,340,081 (the inner change
 alone is not enough: 3/1,098,157). Also reported to Apple (FB23590387) and

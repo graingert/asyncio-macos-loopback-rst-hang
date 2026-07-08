@@ -347,7 +347,7 @@ reproducer under QEMU/KVM, neither reproduces (OpenBSD 7.4: 0/1,512,615; NetBSD
 9.3: 0/915,874), while FreeBSD does.
 
 Suggested fix (two parts: accept rcv_nxt as an exact match in the reset test, and
-anchor the outer window edge at rcv_nxt + rcv_wnd; details + diff in PR <NNNNNN>).
+anchor the outer window edge at rcv_nxt + rcv_wnd; details + diff in bug 296594).
 I built both into a 15.1p1 GENERIC kernel and ran the reproducer under QEMU/KVM:
 stock hangs at 15/1,919,209, both changes give 0/2,340,081 (the inner change
 alone is not enough: 3/1,098,157). Also reported to Apple (FB23590387) and
