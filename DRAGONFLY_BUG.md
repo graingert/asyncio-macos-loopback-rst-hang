@@ -93,7 +93,7 @@ anchoring RST validation on `rcv_nxt`:
   th_seq matches rcv_nxt in case the RST follows the data immediately. otherwise
   we would ignore RST for delayed acks; ok deraadt, dhartmei."*
   - `sys/netinet/tcp_input.c` rev **1.194**, 2005-12-01 (core delayed-ACK fix) —
-    cvsweb: https://cvsweb.openbsd.org/cgi-bin/cvsweb/src/sys/netinet/tcp_input.c.diff?r1=1.193&r2=1.194
+    cvsweb: https://cvsweb.openbsd.org/diff/src/sys/netinet/tcp_input.c?rev=1.194&prev=1.193
     · GitHub mirror: https://github.com/openbsd/src/commit/89ef4ab4d975
   - The `rcv_nxt + 1` arm (Windows clients) followed 2006-12-11 —
     GitHub mirror: https://github.com/openbsd/src/commit/02c0aee39485
