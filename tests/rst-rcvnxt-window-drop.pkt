@@ -1,0 +1,53 @@
+// packetdrill regression test for FreeBSD bug 296594 -- fix #2 (window edge).
+//
+// The RST-acceptance window's right edge is anchored on last_ack_sent + rcv_wnd.
+// When the receiver has delayed-ACKed data and its receive window has shrunk
+// below the un-ACKed gap (rcv_nxt - last_ack_sent > rcv_wnd), a valid RST at
+// rcv_nxt falls beyond last_ack_sent + rcv_wnd and is silently dropped by the
+// window check, before the reset test is reached (no challenge ACK, connection
+// hangs). Fix #2 anchors the right edge on rcv_nxt + rcv_wnd, admitting the RST
+// so the reset test (fix #1) can act on it. This test requires BOTH fixes: a
+// fix-#1-only kernel still drops the RST at the (unfixed) outer window edge.
+//
+// Determinism: a small SO_RCVBUF (< 2*MSS, so it is not rounded up) and a
+// handshake WITHOUT window scaling pin the receive buffer to B = 1200 bytes.
+// A single sub-MSS segment of G = 900 bytes is delay-ACKed, so last_ack_sent
+// stays 1 while rcv_nxt = 901; the window check recomputes rcv_wnd from the
+// remaining buffer space, rcv_wnd = B - G = 300. The gap (900) now exceeds
+// rcv_wnd (300), so rcv_nxt (901) > last_ack_sent + rcv_wnd (301): the RST is
+// beyond the stock window edge. (Verified live via DTrace on tcp_do_segment.)
+//
+// PASS (both fixes): the RST resets -- buffered data drains, then read() reports
+//   ECONNRESET.
+// FAIL (stock / fix-1-only): the RST is silently dropped by the window check;
+//   the connection stays ESTABLISHED, so the second (non-blocking) read()
+//   returns EAGAIN.
+
+`sysctl -q net.inet.tcp.insecure_rst=0 net.inet.tcp.delayed_ack=1`
+
+// --- establish, local end passive, small receive buffer, no window scaling ---
+    0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
+   +0 setsockopt(3, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
+   +0 setsockopt(3, SOL_SOCKET, SO_RCVBUF, [1200], 4) = 0
+   +0 bind(3, ..., ...) = 0
+   +0 listen(3, 1) = 0
+
+// Client SYN carries NO wscale, so the window is not scaled.
+   +0 < S 0:0(0) win 65535 <mss 1460,sackOK,nop,nop>
+   +0 > S. 0:0(0) ack 1 win 1200 <mss 1460,sackOK,eol,eol>
+  +.1 < . 1:1(0) ack 1 win 65535
+   +0 accept(3, ..., ...) = 4
+   +0 fcntl(4, F_SETFL, O_RDWR|O_NONBLOCK) = 0
+
+// --- shrink the window below the delayed-ACK gap ---
+// G = 900 bytes (<= MSS, delay-ACKed): rcv_nxt = 901, last_ack_sent = 1, and the
+// window shrinks to rcv_wnd = 1200 - 900 = 300 < gap (900), so rcv_nxt (901)
+// sits beyond last_ack_sent + rcv_wnd (301).
+   +0 < P. 1:901(900) ack 1 win 65535
+
+// --- the valid RST at RCV.NXT, now beyond the shrunk window's right edge ---
+   +0 < R. 901:901(0) ack 1 win 65535
+
+// --- assert the reset ---
+   +0 read(4, ..., 900) = 900
+   +0 read(4, ..., 900) = -1 ECONNRESET (Connection reset by peer)
