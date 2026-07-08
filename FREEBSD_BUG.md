@@ -145,6 +145,38 @@ rcv_wnd` is the true right edge of the receive window:
  		    (tp->rcv_wnd == 0 && tp->last_ack_sent == th->th_seq)) {
 ```
 
+### Prior art: the sibling BSDs already anchor on `rcv_nxt`
+
+Anchoring RST validation on `rcv_nxt` is **not novel** — both other kqueue BSDs
+adopted it years ago, each landing the change with a commit message that names the
+delayed-ACK RST failure directly:
+
+- **OpenBSD** — `markus`, 2005-12-01 and 2006-12-11. Accepts a RST whose seq
+  matches `last_ack_sent`, `rcv_nxt`, or `rcv_nxt + 1`. *"allow RST if the th_seq
+  matches rcv_nxt in case the RST follows the data immediately. otherwise we would
+  ignore RST for delayed acks."*
+- **NetBSD** — `christos`, 2009-06-20 (patch from Joanne M Mikkelson). Validates a
+  RST against `rcv_nxt` exactly. *"Don't check against the last ack received, but
+  the expected sequence number. This makes RST handling independent of delayed
+  ACK."* (Following `draft-ietf-tcpm-tcpsecure-11`, which became RFC 5961.)
+
+Running the same `c/repro.c` under QEMU/KVM confirms the anchor is what matters —
+the two `rcv_nxt`-anchored BSDs do not reproduce the hang, while the two that
+anchor on `last_ack_sent` do:
+
+| kernel | RST validation anchor | 180 s repro run | hangs |
+| --- | --- | --- | --- |
+| OpenBSD 7.4 | `last_ack_sent` / `rcv_nxt` / `rcv_nxt + 1` | 1,512,615 conns | **0** |
+| NetBSD 9.3 | `rcv_nxt` (exact) | 915,874 conns | **0** |
+| FreeBSD 15.1 | `last_ack_sent` only | — | hangs (below) |
+| DragonFly 6.4.2 | window on `last_ack_sent`, no challenge ACK | 450,584 conns | 0 so far (rare residual only — see `DRAGONFLY_BUG.md`) |
+
+FreeBSD's own in-tree comment has acknowledged the delayed-ACK gap since 2014
+without acting on it. The change requested here brings FreeBSD in line with
+deployed, reviewed prior art rather than introducing new behaviour. Full lineage
+(incl. the DragonFly and XNU/Darwin variants that share the unfixed anchor) is in
+`PRIOR_ART.md`.
+
 ### Validation (patched kernel)
 
 Built into FreeBSD 15.1-RELEASE-p1 GENERIC kernels under QEMU/KVM and run against
@@ -297,6 +329,12 @@ Self-contained C reproducer (libc only, raw kqueue/kevent + sockets):
 On FreeBSD 15.1-RELEASE (amd64) it reproduces at 312 / 10,336,808 connections
 (~1 in 33k) in a 600s run; never on Linux (epoll). The same reproducer hits it
 far more often on macOS (up to ~28-46% on macOS 26), which shares this code.
+
+Anchoring RST validation on rcv_nxt is deployed prior art: OpenBSD (markus,
+2005/2006) and NetBSD (christos, 2009) both fixed exactly this delayed-ACK RST
+failure that way, each with a commit message that names it. Running the same
+reproducer under QEMU/KVM, neither reproduces (OpenBSD 7.4: 0/1,512,615; NetBSD
+9.3: 0/915,874), while FreeBSD does.
 
 Suggested fix (two parts: accept rcv_nxt as an exact match in the reset test, and
 anchor the outer window edge at rcv_nxt + rcv_wnd; details + diff in PR <NNNNNN>).
