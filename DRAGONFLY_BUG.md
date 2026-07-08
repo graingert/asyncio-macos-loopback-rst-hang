@@ -91,11 +91,23 @@ anchoring RST validation on `rcv_nxt`:
 - **OpenBSD** (markus, 2005 + 2006): accepts a RST whose seq matches
   `last_ack_sent`, `rcv_nxt`, or `rcv_nxt + 1`. Commit message: *"allow RST if the
   th_seq matches rcv_nxt in case the RST follows the data immediately. otherwise
-  we would ignore RST for delayed acks."*
-- **NetBSD** (christos, 2009, patch from Joanne M Mikkelson): validates a RST
-  against `rcv_nxt` exactly. Commit message: *"Don't check against the last ack
-  received, but the expected sequence number. This makes RST handling independent
-  of delayed ACK."*
+  we would ignore RST for delayed acks; ok deraadt, dhartmei."*
+  - `sys/netinet/tcp_input.c` rev **1.194**, 2005-12-01 (core delayed-ACK fix) —
+    cvsweb: https://cvsweb.openbsd.org/cgi-bin/cvsweb/src/sys/netinet/tcp_input.c.diff?r1=1.193&r2=1.194
+    · GitHub mirror: https://github.com/openbsd/src/commit/89ef4ab4d975
+  - The `rcv_nxt + 1` arm (Windows clients) followed 2006-12-11 —
+    GitHub mirror: https://github.com/openbsd/src/commit/02c0aee39485
+- **NetBSD** (christos/zoulas, 2009, patch from Joanne M Mikkelson): validates a
+  RST against `rcv_nxt` exactly. Commit message: *"Follow exactly the
+  recommendation of draft-ietf-tcpm-tcpsecure-11.txt: Don't check against the last
+  ack received, but the expected sequence number. This makes RST handling
+  independent of delayed ACK. From Joanne M Mikkelson."*
+  - `sys/netinet/tcp_input.c` rev **1.296**, 2009-06-20 —
+    cvsweb: https://cvsweb.netbsd.org/bsdweb.cgi/src/sys/netinet/tcp_input.c.diff?r1=1.295&r2=1.296
+    · GitHub mirror: https://github.com/NetBSD/src/commit/8d20d2e95368
+  - Neither project used a bug ticket: OpenBSD landed straight from tech@, NetBSD
+    straight from the tech-net thread
+    (https://mail-index.netbsd.org/tech-net/2009/06/16/msg001400.html).
 
 DragonFly (like FreeBSD and XNU) never took the `rcv_nxt` anchor. See
 `PRIOR_ART.md` for the full lineage.
