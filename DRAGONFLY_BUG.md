@@ -132,6 +132,24 @@ beyond `last_ack_sent + rcv_wnd = 3142884303` → the window check drops it. Thi
 DragonFly's `SEQ_LEQ(th->th_seq, last_ack_sent + rcv_wnd)` test failing,
 byte-for-byte.
 
+### Expected rate (from FreeBSD with the first fix in place)
+
+That `RSTINNER` kernel — FreeBSD patched with only the first fix (accept a RST at
+`rcv_nxt` as an exact match), which removes the common challenge-ACK failure — is
+the closest available analogue to DragonFly: what remains is *exactly* the
+outer-edge drop that is DragonFly's sole failure mode. Its measured residual rate
+sets the expectation for how often `c/repro.c` should catch this on DragonFly:
+
+- **~3 / 1,098,157 connections (~1 in 370,000)** on `RSTINNER`, versus the stock
+  FreeBSD kernel's ~1 in 128k for the *primary* challenge-ACK hang.
+- Bursty: the first residual hang appeared anywhere from **~290,000 to ~20,000,000
+  connections** across separate runs (it is a tight, timing-sensitive race — see
+  the Heisenbug caveat in `FREEBSD_BUG.md`).
+
+So on DragonFly, expect roughly one hang per few hundred thousand to tens of
+millions of connections — a long/looped run (or the `-jN` parallel mode of
+`c/repro.c`) is needed to observe it, and a short pass may well see zero.
+
 ### Empirical status on DragonFly
 
 Reproduced under QEMU/KVM on DragonFly 6.4.2-RELEASE (`X86_64_GENERIC`), running
