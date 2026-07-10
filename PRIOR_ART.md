@@ -3,11 +3,22 @@
 Context for `FREEBSD_BUG.md`. The bug is that FreeBSD's RFC 5961 §3.2 RST
 handling validates an incoming RST against `last_ack_sent` only, and never
 against `rcv_nxt`. When a delayed ACK leaves `rcv_nxt > last_ack_sent`, a
-legitimate RST carrying `SEG.SEQ == rcv_nxt` fails the exact-match test and is
-answered with a challenge ACK (or, once the receive window has shrunk below the
-gap, silently dropped) instead of resetting the connection. The peer has already
-forgotten the connection, so the challenge ACK is itself answered with a RST at
-the same seq, and the exchange never converges — the local side hangs.
+legitimate RST carrying `SEG.SEQ == rcv_nxt` fails the exact-match test in one of
+three ways, none of which reset the connection: (1) in-window, it is answered
+with a **challenge ACK**; (2) once the receive window has shrunk below the gap,
+it is **silently dropped** by the outer window check; (3) once the window reaches
+**zero**, it is rejected by the zero-window arm (which also tests `last_ack_sent`
+only). The peer has already forgotten the connection, so the challenge ACK is
+itself answered with a RST at the same seq, and the exchange never converges —
+the local side hangs.
+
+The complete fix therefore has **three parts** (accept `rcv_nxt` in the reset
+test, anchor the window edge at `rcv_nxt + rcv_wnd`, and accept `rcv_nxt` in the
+zero-window arm). Cases 1 and 2 arise organically; case 3 is not reached by a
+conforming loopback flow but is directly reachable with crafted packets and is
+wire-proven — two GENERIC kernels differing only by the zero-window change give a
+clean red/green on a deterministic packetdrill test (`tests/rst-rcvnxt-zero-window.pkt`).
+See `FREEBSD_BUG.md` for the diffs and validation.
 
 The fix — anchor RST validation on `rcv_nxt`, not `last_ack_sent` — is **not
 novel**. Both sibling BSDs adopted it years ago, each with a commit message that

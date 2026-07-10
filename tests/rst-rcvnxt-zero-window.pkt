@@ -1,0 +1,75 @@
+// packetdrill test that ISOLATES the "arm-B token" -- the RST-at-rcv_nxt case
+// that survives fixes #1 and #2 and is only closed by also accepting rcv_nxt in
+// the zero-window / closing-state exact-match arm.
+//
+// Background. After fixes #1 (accept rcv_nxt in the reset test) and #2 (anchor
+// the acceptance window's right edge on rcv_nxt + rcv_wnd), the outer window
+// clause admits a RST at rcv_nxt whenever rcv_wnd > 0:
+//     SEQ_LT(rcv_nxt, rcv_nxt + rcv_wnd)  is true iff rcv_wnd > 0.
+// The ONE state fixes #1+#2 do NOT cover is rcv_wnd == 0 with a still-pending
+// delayed ACK (rcv_nxt > last_ack_sent): then SEQ_LT(rcv_nxt, rcv_nxt + 0) is
+// false, arm A fails, and the zero-window arm (arm B) rescues only
+// last_ack_sent / last_ack_sent - 1 -- not rcv_nxt. So a valid RST at rcv_nxt is
+// dropped and the connection hangs. Adding rcv_nxt to arm B closes it.
+//
+// This differs from rst-rcvnxt-window-drop.pkt only in the fill size: that test
+// leaves rcv_wnd = 300 (> 0), which fix #1's widened edge already admits, so it
+// is GREEN on a fix-#1+#2 kernel regardless of the arm-B token. Here the fill is
+// sized to rcv_wnd = 0 exactly, so the RST at rcv_nxt reaches ONLY via arm B.
+//
+// Determinism: small SO_RCVBUF (< 2*MSS, not rounded up) + no window scaling pin
+// the receive buffer to B = 1200. A single sub-MSS segment of G = 1200 bytes is
+// delay-ACKed, so last_ack_sent stays 1 while rcv_nxt = 1201 and the recomputed
+// rcv_wnd = B - G = 0. The RST at rcv_nxt (1201) then has SEQ_LT(1201, 1201+0)
+// false -> arm A misses it; only the arm-B rcv_nxt token accepts it.
+//
+// Reachability: PROVEN. The SUT delays the ACK of the window-closing segment,
+// so at RST time rcv_wnd == 0 and last_ack_sent (1) < rcv_nxt (1201). Verified
+// red/green on two FreeBSD 15.1-RELEASE GENERIC kernels under QEMU/KVM that
+// differ ONLY by this arm-B one-liner (both carry fixes #1 and #2, verified by
+// the other two tests passing on both):
+//
+//   kernel (uname -i)        challenge-ack   window-drop   zero-window(this)
+//   RSTBOTH  (#1+#2)             GREEN           GREEN          RED (EAGAIN)
+//   RSTARMB  (#1+#2+arm-B)       GREEN           GREEN          GREEN
+//
+// So the arm-B state is genuinely reachable and the token is a real fix, not
+// dead code. (An organic loopback flow rarely reaches it -- a conforming sender
+// will not push data past a zero window -- which is why c/repro.c on an
+// #1+#2 kernel can run far without hitting it; packetdrill crafts the state
+// directly, as RFC 5961's "RST at RCV.NXT MUST reset" permits regardless of
+// window.)
+//
+// PASS (arm-B token present): the RST resets -- buffered data drains, then
+//   read() reports ECONNRESET.
+// FAIL (no arm-B token): the RST is dropped by the outer clause; the connection
+//   stays ESTABLISHED, so the second (non-blocking) read() returns EAGAIN.
+
+`sysctl -q net.inet.tcp.insecure_rst=0 net.inet.tcp.delayed_ack=1`
+
+// --- establish, local end passive, small receive buffer, no window scaling ---
+    0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
+   +0 setsockopt(3, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
+   +0 setsockopt(3, SOL_SOCKET, SO_RCVBUF, [1200], 4) = 0
+   +0 bind(3, ..., ...) = 0
+   +0 listen(3, 1) = 0
+
+// Client SYN carries NO wscale, so the window is not scaled.
+   +0 < S 0:0(0) win 65535 <mss 1460,sackOK,nop,nop>
+   +0 > S. 0:0(0) ack 1 win 1200 <mss 1460,sackOK,eol,eol>
+  +.1 < . 1:1(0) ack 1 win 65535
+   +0 accept(3, ..., ...) = 4
+   +0 fcntl(4, F_SETFL, O_RDWR|O_NONBLOCK) = 0
+
+// --- fill the receive window to EXACTLY zero ---
+// G = 1200 bytes (<= MSS, delay-ACKed): rcv_nxt = 1201, last_ack_sent = 1, and
+// the window closes to rcv_wnd = 1200 - 1200 = 0. rcv_nxt (1201) therefore has
+// no positive slack: SEQ_LT(1201, rcv_nxt + rcv_wnd = 1201) is false.
+   +0 < P. 1:1201(1200) ack 1 win 65535
+
+// --- the valid RST at RCV.NXT, with rcv_wnd == 0 (arm-A misses; needs arm B) ---
+   +0 < R. 1201:1201(0) ack 1 win 65535
+
+// --- assert the reset ---
+   +0 read(4, ..., 1200) = 1200
+   +0 read(4, ..., 1200) = -1 ECONNRESET (Connection reset by peer)

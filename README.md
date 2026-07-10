@@ -93,9 +93,10 @@ connection; 52374 closes, 22467 is left hung):
 22467->52374  F. seq 1850944913, ack 1888935822            # app gives up, closes (FIN)
 ```
 
-The receiver-side fix has **two** required parts — accept `rcv_nxt` as an exact
-match in the reset test, **and** anchor the outer window clause's right edge at
-`rcv_nxt + rcv_wnd` — written up in [`FREEBSD_BUG.md`](FREEBSD_BUG.md).
+The receiver-side fix has **three** required parts — accept `rcv_nxt` as an exact
+match in the reset test, anchor the outer window clause's right edge at
+`rcv_nxt + rcv_wnd`, **and** accept `rcv_nxt` in the zero-window arm — written up
+in [`FREEBSD_BUG.md`](FREEBSD_BUG.md).
 
 **Validated on a patched kernel.** Built into FreeBSD 15.1-RELEASE-p1 GENERIC
 kernels under QEMU/KVM, with distinct idents (`uname -i`-verified) so each result
@@ -110,11 +111,20 @@ is unambiguously attributable:
 The inner fix alone is *not* enough: a residual persists, and a `tcpdump` capture
 on `RSTINNER` proves it is the **outer-clause drop** the second change targets
 (RST at `rcv_nxt`, `last_ack_sent` lagging one 16332-byte segment, `rcv_wnd≈308`,
-so `seq ≫ last_ack_sent + rcv_wnd` → silently dropped). Both changes together
-eliminate the hang (0 across 31.65M connections, where `RSTINNER` hit it within
-~20M). The residual is a timing-sensitive Heisenbug — bursty, and perturbed by
-`fbt` DTrace on the hot path, so the wire capture uses `tcpdump`'s BPF tap; see
+so `seq ≫ last_ack_sent + rcv_wnd` → silently dropped). Changes 1 + 2 together
+eliminate the *organic* hang (0 across 31.65M connections, where `RSTINNER` hit it
+within ~20M). The residual is a timing-sensitive Heisenbug — bursty, and perturbed
+by `fbt` DTrace on the hot path, so the wire capture uses `tcpdump`'s BPF tap; see
 [`FREEBSD_BUG.md`](FREEBSD_BUG.md).
+
+The **third part** (accept `rcv_nxt` in the zero-window arm) covers a case an
+organic sender never reaches — hence `RSTBOTH`'s 0/31.65M above — but crafted
+packets do. Two GENERIC kernels differing only by that one line, `RSTBOTH`
+(changes 1 + 2) and `RSTARMB` (changes 1 + 2 + 3), give a clean red/green on a
+deterministic packetdrill test (`tests/rst-rcvnxt-zero-window.pkt`, RST at
+`rcv_nxt` with `rcv_wnd == 0` under a delayed ACK): `RSTBOTH` fails it
+(`read` → `EAGAIN`), `RSTARMB` passes it (`ECONNRESET`), both pass the other two
+tests.
 
 ## Run
 

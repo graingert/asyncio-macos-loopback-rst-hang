@@ -110,8 +110,9 @@ for ~3 s until the application closes it.
 
 ### Suggested fix
 
-**Two** changes to the RFC 5961 RST handling are required; a patched kernel with
-only the first still hangs (see [Validation](#validation-patched-kernel)).
+**Three** changes to the RFC 5961 RST handling are required; each closes a
+distinct sub-case, and a kernel missing any one of them still hangs on that
+sub-case (see [Validation](#validation-patched-kernel)).
 
 **1. Accept `rcv_nxt` as an exact match in the reset test** — the RFC 5961-mandated
 point — in addition to the existing `last_ack_sent` leniency:
@@ -142,6 +143,26 @@ rcv_wnd` is the true right edge of the receive window:
 +		    SEQ_LT(th->th_seq, tp->rcv_nxt + tp->rcv_wnd)) ||
  		    (tp->rcv_wnd == 0 && tp->last_ack_sent == th->th_seq)) {
 ```
+
+**3. Accept `rcv_nxt` in the zero-window arm.** When `rcv_wnd == 0`, the outer
+window check (arm A) can never admit a RST at `rcv_nxt` — `SEQ_LT(rcv_nxt,
+rcv_nxt + 0)` is false — so acceptance falls to the zero-window arm, which also
+tests `last_ack_sent` only. Under a delayed ACK (`rcv_nxt > last_ack_sent`) a
+RST at `rcv_nxt` is rejected there too (shown against the post-change-2 tree):
+
+```diff
+ 		if ((SEQ_GEQ(th->th_seq, tp->last_ack_sent) &&
+ 		    SEQ_LT(th->th_seq, tp->rcv_nxt + tp->rcv_wnd)) ||
+-		    (tp->rcv_wnd == 0 && tp->last_ack_sent == th->th_seq)) {
++		    (tp->rcv_wnd == 0 && (tp->last_ack_sent == th->th_seq ||
++		    tp->rcv_nxt == th->th_seq))) {
+```
+
+An organic loopback flow does not reach this arm (a conforming sender will not
+push data past a zero window), so changes 1 + 2 alone show 0 hangs across 31.65M
+connections; but the state *is* reachable with crafted packets and is wire-proven
+below (`rst-rcvnxt-zero-window.pkt`). RFC 5961 requires a RST at `RCV.NXT` to
+reset regardless of the advertised window.
 
 ### Prior art: the sibling BSDs already anchor on `rcv_nxt`
 
@@ -213,23 +234,45 @@ by `fbt` DTrace on `tcp_do_segment` (which adds hot-path latency); the wire
 capture above uses `tcpdump`'s out-of-band BPF tap, which does not disturb it. The
 *primary* hang is not timing-fragile (DTrace matched it exactly, 17/17).
 
+**Change 3 (the zero-window arm) is validated separately, via packetdrill,**
+because the organic `c/repro.c` run above never reaches it — a conforming sender
+will not push data past a zero window, which is why `RSTBOTH` (changes 1 + 2)
+shows 0 hangs across 31.65M organic connections. The state *is* reachable with
+crafted packets, though. Two GENERIC kernels differing **only** by change 3 —
+`RSTBOTH` (changes 1 + 2) and `RSTARMB` (changes 1 + 2 + 3) — booted under
+QEMU/KVM with `uname -i` verified, give a clean red/green on the zero-window test
+(RST at `rcv_nxt`, `rcv_wnd == 0`, delayed ACK), while both pass the other two:
+
+| test | stock `GENERIC` | `RSTBOTH` (1 + 2) | `RSTARMB` (1 + 2 + 3) |
+| --- | --- | --- | --- |
+| `rst-rcvnxt-challenge-ack.pkt` (fix 1) | RED | GREEN | GREEN |
+| `rst-rcvnxt-window-drop.pkt` (fix 2) | RED | GREEN | GREEN |
+| `rst-rcvnxt-zero-window.pkt` (fix 3) | RED | **RED** (`read` → `EAGAIN`) | **GREEN** (`ECONNRESET`) |
+
+The single-line difference between `RSTBOTH` and `RSTARMB` flipping only the
+zero-window test proves the arm-B gap is real and the third change closes it.
+
 ### Regression tests (packetdrill)
 
-Two deterministic packetdrill scripts, one per fix, live in `tests/`. Verified on
-FreeBSD 16.0-CURRENT under QEMU/KVM against a stock GENERIC kernel and one patched
-with `freebsd-current-tcp-rst-rcvnxt.patch` (both use a non-blocking socket so the
-buggy case fails fast with `EAGAIN` rather than blocking):
+Three deterministic packetdrill scripts, one per fix, live in `tests/`. All use a
+non-blocking socket so the buggy case fails fast with `EAGAIN` rather than
+blocking. Verified under QEMU/KVM against a stock GENERIC kernel, a kernel with
+only fixes 1 + 2 (`RSTBOTH`), and one with all three (`RSTARMB`, i.e. patched with
+`freebsd-current-tcp-rst-rcvnxt.patch`):
 
-| test | stock | patched |
-| --- | --- | --- |
-| `rst-rcvnxt-challenge-ack.pkt` (fix 1: RST at rcv_nxt, in-window) | RED — challenge-ACK'd (`read` → EAGAIN) | GREEN — `ECONNRESET` |
-| `rst-rcvnxt-window-drop.pkt` (fix 2: rcv_wnd shrunk below the gap) | RED — silently dropped (no challenge ACK) | GREEN — `ECONNRESET` |
+| test | stock | fixes 1 + 2 | all three |
+| --- | --- | --- | --- |
+| `rst-rcvnxt-challenge-ack.pkt` (fix 1: RST at rcv_nxt, in-window) | RED — challenge-ACK'd (`read` → EAGAIN) | GREEN — `ECONNRESET` | GREEN |
+| `rst-rcvnxt-window-drop.pkt` (fix 2: rcv_wnd shrunk below the gap) | RED — silently dropped (no challenge ACK) | GREEN — `ECONNRESET` | GREEN |
+| `rst-rcvnxt-zero-window.pkt` (fix 3: rcv_wnd == 0, delayed ACK) | RED — rejected by the zero-window arm | **RED** — still rejected | **GREEN** — `ECONNRESET` |
 
 The window-drop test uses a small `SO_RCVBUF` (< 2·MSS, so it is not rounded up)
 and a sub-MSS delay-ACKed fill to shrink `rcv_wnd` below the gap, so the RST at
 `rcv_nxt` lands beyond `last_ack_sent + rcv_wnd` — confirmed live with DTrace on
-`tcp_do_segment`. It requires both fixes (a fix-1-only kernel still drops it at the
-unfixed outer edge).
+`tcp_do_segment`. It requires fixes 1 + 2 (a fix-1-only kernel still drops it at
+the unfixed outer edge). The zero-window test sizes the delay-ACked fill to bring
+`rcv_wnd` to **exactly 0**, so the RST at `rcv_nxt` reaches only the zero-window
+arm — it stays RED on a fixes-1+2 kernel and needs fix 3.
 
 ## How to reproduce
 
@@ -352,13 +395,17 @@ failure that way, each with a commit message that names it. Running the same
 reproducer under QEMU/KVM, neither reproduces (OpenBSD 7.4: 0/1,512,615; NetBSD
 9.3: 0/915,874), while FreeBSD does.
 
-Suggested fix (two parts: accept rcv_nxt as an exact match in the reset test, and
-anchor the outer window edge at rcv_nxt + rcv_wnd; details + diff in bug 296594).
-I built both into a 15.1p1 GENERIC kernel and ran the reproducer under QEMU/KVM:
-stock hangs at 15/1,919,209, both changes give 0/2,340,081 (the inner change
-alone is not enough: 3/1,098,157). Also reported to Apple (FB23590387) and
-CPython (python/cpython#153117), since asyncio's deferred close makes it surface
-as a silent hang.
+Suggested fix (three parts: accept rcv_nxt as an exact match in the reset test,
+anchor the outer window edge at rcv_nxt + rcv_wnd, and accept rcv_nxt in the
+zero-window arm; details + diff in bug 296594). I built these into 15.1p1 GENERIC
+kernels under QEMU/KVM: stock hangs at 15/1,919,209, and changes 1 + 2 give
+0/31,651,215 organic connections (the inner change alone is not enough:
+residual at ~287k). The third change covers the rcv_wnd == 0 case, which an
+organic sender does not reach but crafted packets do -- proven with a
+deterministic packetdrill test (rst-rcvnxt-zero-window.pkt) that is RED on a
+changes-1+2 kernel and GREEN with all three. Also reported to Apple (FB23590387)
+and CPython (python/cpython#153117), since asyncio's deferred close makes it
+surface as a silent hang.
 
 Happy to test patches or gather more data (tcpdump, dtrace, etc.).
 

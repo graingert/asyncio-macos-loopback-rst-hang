@@ -1,40 +1,69 @@
-From ed085c04918dd53e11219cecfde7d9706a5a95be Mon Sep 17 00:00:00 2001
+From bf15f026cf90f39609bc40ded4d0826ab988aa78 Mon Sep 17 00:00:00 2001
 From: Thomas Grainger <tagrain@gmail.com>
-Date: Wed, 8 Jul 2026 10:37:25 +0100
+Date: Fri, 10 Jul 2026 00:00:00 +0100
 Subject: [PATCH] tcp: reset the connection on a valid RST at rcv_nxt under a
  delayed ACK
 
-RFC 5961 3.2 requires a RST with SEG.SEQ == RCV.NXT to reset the connection.
-tcp_do_segment() tests the exact-match reset condition against last_ack_sent
-instead of rcv_nxt, and anchors the acceptance window's right edge on
-last_ack_sent + rcv_wnd. When the receiver has delayed-ACKed data
-(rcv_nxt > last_ack_sent), a valid RST at rcv_nxt (the peer's SND.NXT) is
-either answered with a challenge ACK instead of resetting, or -- once rcv_wnd
-has shrunk below the delayed-ACK gap -- dropped by the window check before the
-reset test is reached. Either way the connection is left ESTABLISHED
-(half-open): the peer that sent the RST has already fully closed, so nothing
-retransmits it.
+PR: 296594
 
-Accept a RST at rcv_nxt as an exact match in the reset test, and anchor the
-window's right edge on rcv_nxt + rcv_wnd. This matches the behaviour OpenBSD
-(tcp_input.c rev 1.194, 2005) and NetBSD (rev 1.296, 2009) adopted for the
-same delayed-ACK RST failure.
+RFC 5961 Section 3.2 requires a RST with SEG.SEQ == RCV.NXT to reset the
+connection.  tcp_do_segment() tests the exact-match reset condition against
+last_ack_sent instead of rcv_nxt, and anchors the acceptance window's right
+edge on last_ack_sent + rcv_wnd.  When the receiver has delayed-ACKed data
+(rcv_nxt > last_ack_sent), a valid RST at rcv_nxt (the peer's SND.NXT) is left
+unhandled in three ways:
 
+  1. in-window, rcv_wnd large: the inner exact-match test accepts only
+     last_ack_sent, so the RST draws a challenge ACK instead of resetting;
+  2. rcv_wnd shrunk below the delayed-ACK gap: the RST at rcv_nxt falls beyond
+     last_ack_sent + rcv_wnd and is silently dropped by the outer window check;
+  3. rcv_wnd == 0: the zero-window arm accepts only last_ack_sent, so the RST
+     is rejected there too.
+
+In every case the connection is left ESTABLISHED (half-open): the peer that
+sent the RST has already fully closed, so nothing retransmits it.  A registered
+kevent/EVFILT_READ never fires, SO_ERROR == 0, and recv(..., MSG_PEEK) returns
+EAGAIN, until the application gives up and closes the socket seconds later.
+
+Accept a RST at rcv_nxt as an exact match everywhere last_ack_sent is accepted
+(the in-window reset test and the zero-window arm), and anchor the window's
+right edge on rcv_nxt + rcv_wnd.  This is strictly more RFC 5961-conformant (a
+RST at RCV.NXT MUST reset) and does not weaken the anti-spoofing intent: an
+off-path attacker must still guess rcv_nxt (or last_ack_sent) exactly;
+in-window but non-exact RSTs still draw a challenge ACK.  OpenBSD (tcp_input.c
+rev 1.194, 2005) and NetBSD (rev 1.296, 2009) both anchor RST validation on
+rcv_nxt for exactly this delayed-ACK failure.
+
+Each of the three sub-cases has a deterministic packetdrill regression test,
+verified red/green on 15.1-RELEASE GENERIC kernels under QEMU/KVM: a kernel
+with only the first two changes still fails the zero-window case (RST at
+rcv_nxt, rcv_wnd == 0, delayed ACK) -- read() returns EAGAIN instead of
+ECONNRESET -- and all three changes together make every case pass.
+
+Reproducer (libc only, raw kqueue/kevent + sockets); on 15.1-RELEASE amd64 it
+reproduces at ~312 / 10.3M connections in a 600s run, never on Linux:
+https://github.com/graingert/asyncio-macos-loopback-rst-hang (c/repro.c)
+
+Also reported to Apple (FB23590387) and CPython (python/cpython#153117): the
+same code lineage in Darwin/xnu makes it far more frequent on macOS, and
+asyncio's call_soon-deferred close surfaces it as a silent hang.
 ---
- sys/netinet/tcp_input.c | 5 +++--
- 1 file changed, 3 insertions(+), 2 deletions(-)
+ sys/netinet/tcp_input.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
 
 diff --git a/sys/netinet/tcp_input.c b/sys/netinet/tcp_input.c
-index 35a9d76..74c58f4 100644
+index 35a9d76..0c0ae59 100644
 --- a/sys/netinet/tcp_input.c
 +++ b/sys/netinet/tcp_input.c
-@@ -2129,14 +2129,15 @@ tcp_do_segment(struct tcpcb *tp, struct mbuf *m, struct tcphdr *th,
+@@ -2129,14 +2129,16 @@ tcp_do_segment(struct tcpcb *tp, struct mbuf *m, struct tcphdr *th,
  		 *   covered by the RFC.
  		 */
  		if ((SEQ_GEQ(th->th_seq, tp->last_ack_sent) &&
 -		    SEQ_LT(th->th_seq, tp->last_ack_sent + tp->rcv_wnd)) ||
+-		    (tp->rcv_wnd == 0 && tp->last_ack_sent == th->th_seq)) {
 +		    SEQ_LT(th->th_seq, tp->rcv_nxt + tp->rcv_wnd)) ||
- 		    (tp->rcv_wnd == 0 && tp->last_ack_sent == th->th_seq)) {
++		    (tp->rcv_wnd == 0 && (tp->last_ack_sent == th->th_seq ||
++		    tp->rcv_nxt == th->th_seq))) {
  			KASSERT(tp->t_state != TCPS_SYN_SENT,
  			    ("%s: TH_RST for TCPS_SYN_SENT th %p tp %p",
  			    __func__, th, tp));
@@ -46,6 +75,3 @@ index 35a9d76..74c58f4 100644
  				TCPSTAT_INC(tcps_drops);
  				/* Drop the connection. */
  				switch (tp->t_state) {
--- 
-2.43.0
-

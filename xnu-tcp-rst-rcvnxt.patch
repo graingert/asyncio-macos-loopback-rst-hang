@@ -1,0 +1,75 @@
+From fc216b76fcc1d9ea72f90d8a30f38664dca2e8e4 Mon Sep 17 00:00:00 2001
+From: Thomas Grainger <tagrain@gmail.com>
+Date: Fri, 10 Jul 2026 00:00:00 +0100
+Subject: [PATCH] tcp: reset the connection on a valid RST at rcv_nxt under a
+ delayed ACK
+
+Radar / Feedback: FB23590387
+
+RFC 5961 Section 3.2 requires a RST with SEG.SEQ == RCV.NXT to reset the
+connection. In tcp_input(), the RST-validation block tests the exact-match
+reset condition against last_ack_sent (and last_ack_sent - 1) instead of
+rcv_nxt, and anchors the acceptance window's right edge on
+last_ack_sent + rcv_wnd.
+
+When the receiver has delayed-ACKed data (rcv_nxt > last_ack_sent), a valid
+RST at rcv_nxt -- which is exactly what a correct peer sends (SND.NXT) -- is
+either answered with a challenge ACK instead of resetting, silently dropped
+once rcv_wnd has shrunk below the delayed-ACK gap, or (when rcv_wnd == 0)
+rejected by the zero-window exact-match arm. Either way the connection is left
+ESTABLISHED (half-open): the peer that sent the RST has already fully closed,
+so nothing retransmits it. EVFILT_READ never fires, SO_ERROR == 0, and
+recv(..., MSG_PEEK) returns EAGAIN.
+
+This is the more severe variant of the same defect present across the BSDs:
+XNU accepts only last_ack_sent / last_ack_sent - 1 (never rcv_nxt) and, unlike
+FreeBSD, has no net.inet.tcp.insecure_rst escape hatch. OpenBSD (tcp_input.c
+rev 1.194, 2005; markus) and NetBSD (rev 1.296, 2009; christos) both fixed the
+same delayed-ACK RST failure by anchoring RST validation on rcv_nxt.
+
+Fix: accept a RST at rcv_nxt as an exact match wherever last_ack_sent is
+accepted (the in-window reset test and the zero-window/closing-state arm), and
+anchor the acceptance window's right edge on rcv_nxt + rcv_wnd. This is the
+RFC 5961-mandated point and does not weaken the anti-spoofing intent: an
+off-path attacker must still guess rcv_nxt (or last_ack_sent) exactly;
+in-window but non-exact RSTs continue to draw a challenge ACK.
+
+Each of the three sub-cases is covered by a deterministic packetdrill
+regression test, verified red/green on FreeBSD 15.1 GENERIC kernels under
+QEMU/KVM (the same tcp_input.c lineage): a kernel with only the first two
+changes still fails the zero-window case (RST at rcv_nxt, rcv_wnd == 0, delayed
+ACK) with read() returning EAGAIN instead of ECONNRESET; adding the third
+change makes all three pass.
+
+Reproducer (libc only, raw kqueue/kevent + sockets), reproduces on macOS at up
+to ~28-46% of connections on macOS 26, and natively on FreeBSD 15.1 at
+~1 in 33k, never on Linux:
+https://github.com/graingert/asyncio-macos-loopback-rst-hang (c/repro.c)
+
+Also reported: FreeBSD bug 296594; CPython python/cpython#153117 (asyncio's
+call_soon-deferred close makes it surface as a silent hang).
+---
+ bsd/netinet/tcp_input.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/netinet/tcp_input.c b/bsd/netinet/tcp_input.c
+index b283c3b..1ce2d8f 100644
+--- a/bsd/netinet/tcp_input.c
++++ b/bsd/netinet/tcp_input.c
+@@ -4475,11 +4475,13 @@ trimthenstep6:
+ 	 */
+ 	if (thflags & TH_RST) {
+ 		if ((SEQ_GEQ(th->th_seq, tp->last_ack_sent) &&
+-		    SEQ_LT(th->th_seq, tp->last_ack_sent + tp->rcv_wnd)) ||
++		    SEQ_LT(th->th_seq, tp->rcv_nxt + tp->rcv_wnd)) ||
+ 		    ((tp->rcv_wnd == 0 || tp->t_state >= TCPS_CLOSE_WAIT) &&
+ 		    ((tp->last_ack_sent == th->th_seq) ||
+-		    (tp->last_ack_sent - 1 == th->th_seq)))) {
+-			if (tp->last_ack_sent == th->th_seq || tp->last_ack_sent - 1 == th->th_seq) {
++		    (tp->last_ack_sent - 1 == th->th_seq) ||
++		    (tp->rcv_nxt == th->th_seq)))) {
++			if (tp->last_ack_sent == th->th_seq || tp->last_ack_sent - 1 == th->th_seq ||
++			    tp->rcv_nxt == th->th_seq) {
+ 				switch (tp->t_state) {
+ 				case TCPS_SYN_RECEIVED:
+ 					IF_TCP_STATINC(ifp, rstinsynrcv);
