@@ -51,6 +51,30 @@ jobs:
           cc -O2 -o repro_c c/repro.c
           ./repro_c 600
 
+  poll:
+    # Portable poll(2) reproducer (c/repro_poll.c): one source file built on
+    # each platform, no kqueue. Proves the bug lives in the kernel's RFC 5961
+    # RST validation and is reachable through plain poll(2), not a kqueue
+    # artifact.
+    #
+    # macos-26 reproduces -> the first-hang non-zero exit turns the job red
+    # (same "red == bug demonstrated" convention as the other repro jobs).
+    # ubuntu-latest is the CONTROL and must stay green: Linux anchors RST
+    # validation on rcv_nxt, so it never leaves the connection half-open. If
+    # ubuntu ever went red here, that would be a real, surprising regression.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v4
+      - name: build + run (portable poll(2), no kqueue)
+        run: |
+          cc -O2 -o repro_poll c/repro_poll.c
+          ./repro_poll 600 -j4
+
   freebsd:
     # FreeBSD is the original kqueue platform. c/repro.c is pure POSIX/BSD
     # sockets + kqueue, so it builds and runs unchanged. This distinguishes an
@@ -125,6 +149,31 @@ jobs:
             fi
             # Preserve the gate: red build when a hang was observed.
             exit $rc
+
+  poll-freebsd:
+    # The same portable poll(2) reproducer on FreeBSD -- the third leg of the
+    # macos-26 / freebsd / ubuntu comparison, from the one c/repro_poll.c source.
+    # Goes red on the first hang, like the kqueue `freebsd` gate above.
+    #
+    # Serialized after `freebsd` (needs: + if: always()) rather than run
+    # concurrently: two vmactions VM bootstraps in one workflow trip a 429 on
+    # the image (see the `freebsd` job note). `if: always()` is required
+    # because `freebsd` is designed to fail (red) when it reproduces, and a
+    # plain `needs:` would otherwise skip this job.
+    needs: freebsd
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: build + run (portable poll(2), no kqueue) on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          run: |
+            uname -a
+            cc -O2 -o repro_poll c/repro_poll.c
+            ./repro_poll 600 -j4
 
   capture:
     # Capture lo0 during the C repro and dump the hung connection's packets --

@@ -1,6 +1,6 @@
 # TCP RST at rcv_nxt gets a challenge ACK instead of a reset: abortive close of a loopback connection
 
-A minimal, dependency-free reproducer for a **BSD/kqueue-family kernel bug** in
+A minimal, dependency-free reproducer for a **BSD TCP-stack kernel bug** in
 RFC 5961 RST handling. When a loopback TCP connection is **abortively closed** —
 `setsockopt(SO_LINGER, {1, 0})` then `close()` — the RST is emitted correctly and
 put on the wire, but if the peer is holding delayed-ACKed data the peer answers
@@ -21,8 +21,11 @@ wire capture.
 Found via `asyncio`, but it is **not** asyncio-specific: it reproduces with a
 plain `selectors` loop, from Rust, and from pure C. It is **not macOS-specific**
 either — it reproduces on **FreeBSD** (the original kqueue platform) too, so it
-is a **BSD/kqueue-family** bug that macOS 26 makes dramatically more frequent.
-Never observed on Linux (`epoll`).
+is a **BSD TCP-stack** bug — in the `last_ack_sent` lineage (FreeBSD, DragonFly,
+and Darwin/macOS; **not** OpenBSD or NetBSD, which anchor on `rcv_nxt`) — that
+macOS 26 makes dramatically more frequent. Never observed on Linux (`epoll`).
+kqueue is incidental: it is just the readiness API the first reproducers used,
+and the bug reproduces through plain `poll(2)` too (`c/repro_poll.c`).
 
 **Reported upstream:** Apple Feedback Assistant **FB23590387** · CPython
 [python/cpython#153117](https://github.com/python/cpython/issues/153117).
@@ -133,6 +136,8 @@ $ python3 repro.py [SECONDS]                    # asyncio, deferred close
 $ python3 repro_selectors.py [SECONDS]          # plain selectors, immediate close
 $ python3 repro_selectors_deferred.py [SECONDS] # plain selectors, deferred close
 $ python3 repro_kqueue.py [SECONDS]             # raw select.kqueue, deferred close
+$ cc -O2 -o repro_c    c/repro.c      && ./repro_c    [SECONDS]           # pure C, raw kqueue (macOS/FreeBSD)
+$ cc -O2 -o repro_poll c/repro_poll.c && ./repro_poll [SECONDS] [-jN]     # pure C, poll(2) — portable (macOS/FreeBSD/Linux)
 ```
 
 Default 300s. Exit status is non-zero if any undelivered (half-open) close is
@@ -171,8 +176,27 @@ so it is not architecture-specific either):
 | **FreeBSD 15.1-RELEASE (amd64)** | **312 / 10.34M** (~1 in 33k) |
 | Linux (epoll) | 0 / many millions |
 
-So this is a **BSD/kqueue-family** RST-rejection bug, present on FreeBSD at a low
+So this is a **BSD TCP-stack** RST-rejection bug, present on FreeBSD at a low
 rate and amplified enormously on macOS 26.
+
+### Portable `poll(2)` reproducer (no kqueue)
+
+`c/repro_poll.c` is the same reproducer written against `poll(2)` instead of
+`kqueue`, so the **one source file** compiles and runs unchanged on macOS,
+FreeBSD, **and Linux** (each platform builds its own binary). This isolates the
+bug to the kernel's RST validation — it is reachable through plain `poll(2)`, so
+it is not a `kqueue` artifact — and turns the Linux-vs-BSD contrast into a
+single-source experiment:
+
+| platform (`c/repro_poll.c`, 60s × 4 workers) | undelivered / total |
+| --- | --- |
+| **FreeBSD 15.1-RELEASE-p1 GENERIC (amd64)**, under QEMU/KVM | **142 / 1,595,517** (~1 in 11k) |
+| Linux 6.17 (control) | **0 / 68,862** |
+
+Every FreeBSD hang carries the same half-open signature (`SO_ERROR=0`,
+`MSG_PEEK=errno 35` / `EAGAIN`); Linux never hangs, because it anchors RST
+validation on `rcv_nxt`. The `poll` (macOS 26 + Ubuntu) and `poll-freebsd` CI
+jobs build and run this source across all three platforms.
 
 ## What this shows
 
@@ -184,8 +208,9 @@ rate and amplified enormously on macOS 26.
   (`rust/`, raw `kqueue`/`kevent` via `libc`: macOS 14 **20 / 1.89M**, macOS 26
   **597 / 1,831**) and a pure **C** program (`c/repro.c`, raw `kqueue`/`kevent`,
   no libraries: macOS 26 **596 / 2,113**, FreeBSD 15.1 amd64 **312 / 10.34M**).
-  This is a language-agnostic, cross-architecture **BSD/kqueue-family kernel**
-  bug — not unique to macOS or to Apple Silicon.
+  This is a language-agnostic, cross-architecture **BSD TCP-stack kernel**
+  bug — not unique to macOS or to Apple Silicon, and not related to kqueue
+  (it reproduces through plain `poll(2)`, `c/repro_poll.c`).
 - The **deferred close amplifies it** on macOS 14/15 — roughly 3–4× more
   frequent, and it is what surfaces the bug on macOS 15. On macOS 26 the
   amplification has all but vanished: immediate close hangs ~40% of connections
