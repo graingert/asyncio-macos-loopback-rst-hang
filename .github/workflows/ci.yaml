@@ -51,6 +51,25 @@ jobs:
           cc -O2 -o repro_c c/repro.c
           ./repro_c 600
 
+  cfrunloop:
+    # CoreFoundation CFRunLoop/CFSocket reproducer (c/repro_cfrunloop.c): the
+    # app never calls kevent() or poll() -- readiness comes from CFSocket
+    # callbacks delivered by CFRunLoopRunInMode (CFSocket's internal engine is
+    # a select(2) manager thread). Shows the hang is reachable through Apple's
+    # own framework-level event-loop API. macOS-only (CoreFoundation).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v4
+      - name: build + run (pure C, CFRunLoop/CFSocket, no kqueue/poll)
+        run: |
+          cc -O2 -framework CoreFoundation -o repro_cf c/repro_cfrunloop.c
+          ./repro_cf 600 -j4
+
   poll:
     # Portable poll(2) reproducer (c/repro_poll.c): one source file built on
     # each platform, no kqueue. Proves the bug lives in the kernel's RFC 5961
