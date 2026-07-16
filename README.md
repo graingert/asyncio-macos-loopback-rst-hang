@@ -25,7 +25,8 @@ is a **BSD TCP-stack** bug — in the `last_ack_sent` lineage (FreeBSD, DragonFl
 and Darwin/macOS; **not** OpenBSD or NetBSD, which anchor on `rcv_nxt`) — that
 macOS 26 makes dramatically more frequent. Never observed on Linux (`epoll`).
 kqueue is incidental: it is just the readiness API the first reproducers used,
-and the bug reproduces through plain `poll(2)` too (`c/repro_poll.c`).
+and the bug reproduces through plain `poll(2)` (`c/repro_poll.c`) and through
+CoreFoundation's `CFRunLoop`/`CFSocket` (`c/repro_cfrunloop.c`) too.
 
 **Reported upstream:** Apple Feedback Assistant **FB23590387** · CPython
 [python/cpython#153117](https://github.com/python/cpython/issues/153117).
@@ -138,6 +139,7 @@ $ python3 repro_selectors_deferred.py [SECONDS] # plain selectors, deferred clos
 $ python3 repro_kqueue.py [SECONDS]             # raw select.kqueue, deferred close
 $ cc -O2 -o repro_c    c/repro.c      && ./repro_c    [SECONDS]           # pure C, raw kqueue (macOS/FreeBSD)
 $ cc -O2 -o repro_poll c/repro_poll.c && ./repro_poll [SECONDS] [-jN]     # pure C, poll(2) — portable (macOS/FreeBSD/Linux)
+$ cc -O2 -framework CoreFoundation -o repro_cf c/repro_cfrunloop.c && ./repro_cf [SECONDS] [-jN]  # pure C, CFRunLoop/CFSocket (macOS)
 ```
 
 Default 300s. Exit status is non-zero if any undelivered (half-open) close is
@@ -198,6 +200,28 @@ Every FreeBSD hang carries the same half-open signature (`SO_ERROR=0`,
 validation on `rcv_nxt`. The `poll` (macOS 26 + Ubuntu) and `poll-freebsd` CI
 jobs build and run this source across all three platforms.
 
+### CFRunLoop reproducer (Apple's own framework API)
+
+`c/repro_cfrunloop.c` is the same reproducer written against
+**CoreFoundation's [`CFRunLoop`](https://developer.apple.com/documentation/corefoundation/cfrunloop)
++ `CFSocket`** — the readiness API Cocoa applications (and e.g. Twisted's
+`CFReactor`) sit on. The application never calls `kqueue`/`kevent` or
+`poll(2)`: sockets are wrapped with `CFSocketCreateWithNative`, scheduled as
+run-loop sources, and the thread blocks in `CFRunLoopRunInMode` waiting for
+read/write callbacks. (Internally CFSocket services all registered sockets
+from a single hidden manager thread running `select(2)` — a third distinct
+readiness mechanism after kqueue and poll.)
+
+| platform (`c/repro_cfrunloop.c`) | undelivered / total |
+| --- | --- |
+| macOS 26.5.2 (arm64), 30s | **30 / 152** (~20%) |
+| macOS 26.5.2 (arm64), 10s × 4 threads | **40 / 1,056** |
+
+Same half-open signature (`SO_ERROR=0`, `MSG_PEEK=errno 35` / `EWOULDBLOCK`).
+So the hang is reachable through Apple's own high-level event-loop API, not
+just through raw syscalls — any CFRunLoop/NSRunLoop-based networking that
+relies on abortive-close delivery is exposed too.
+
 ## What this shows
 
 - The hang reproduces with **pure `selectors` and no asyncio** (immediate close,
@@ -210,7 +234,8 @@ jobs build and run this source across all three platforms.
   no libraries: macOS 26 **596 / 2,113**, FreeBSD 15.1 amd64 **312 / 10.34M**).
   This is a language-agnostic, cross-architecture **BSD TCP-stack kernel**
   bug — not unique to macOS or to Apple Silicon, and not related to kqueue
-  (it reproduces through plain `poll(2)`, `c/repro_poll.c`).
+  (it reproduces through plain `poll(2)`, `c/repro_poll.c`, and through
+  CoreFoundation's `CFRunLoop`/`CFSocket`, `c/repro_cfrunloop.c`).
 - The **deferred close amplifies it** on macOS 14/15 — roughly 3–4× more
   frequent, and it is what surfaces the bug on macOS 15. On macOS 26 the
   amplification has all but vanished: immediate close hangs ~40% of connections
